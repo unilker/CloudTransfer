@@ -91,6 +91,8 @@ $('#modal-input').addEventListener('keydown', (event) => {
 // ---------------------------------------------------------------- picker
 
 // Everything that differs between the two providers, in one place.
+const PROVIDER_LABELS = { google: 'Google Drive', microsoft: 'OneDrive' };
+
 const PROVIDERS = {
   gdrive: {
     key: 'gdrive',
@@ -136,6 +138,28 @@ class Picker {
 
   get endpoint() { return this.provider.endpoint; }
 
+  /** Re-apply the heading and the selection summary in the current language. */
+  relabel() {
+    if (!this.provider) return;
+    this.title.textContent = t(
+      this.role === 'source' ? 'picker.from' : 'picker.to',
+      { provider: this.provider.name }
+    );
+    if (this.selected) {
+      this.pickedBox.innerHTML = t('picker.selected', {
+        path: `<strong>${escapeHtml(this.selected.path)}</strong>`,
+      });
+    } else {
+      this.pickedBox.textContent = t('picker.nothingSelected');
+      if (!this.ready) {
+        this.listing.innerHTML =
+          `<li class="empty-row">${escapeHtml(
+            t('picker.connectFirst', { provider: this.provider.name })
+          )}</li>`;
+      }
+    }
+  }
+
   /** Point this panel at a provider, discarding whatever was selected. */
   configure(providerKey) {
     const next = PROVIDERS[providerKey];
@@ -145,17 +169,16 @@ class Picker {
     this.selected = null;
     this.ready = false;
 
-    this.title.textContent =
-      (this.role === 'source' ? 'From ' : 'To ') + next.name;
     if (this.newFolderButton) {
       // Only the destination needs new folders, and only where we can make them.
       this.newFolderButton.hidden = this.role !== 'dest' || !next.canCreateFolders;
     }
     this.crumbs.innerHTML = '';
     this.pickedBox.classList.remove('set');
-    this.pickedBox.textContent = 'Nothing selected';
-    this.listing.innerHTML =
-      `<li class="empty-row">Connect ${escapeHtml(next.name)} to browse your folders.</li>`;
+    // relabel() writes the heading, the "nothing selected" line and the
+    // "connect first" placeholder, all in the current language. Nothing may
+    // overwrite them afterwards, or they drop back to the markup's English.
+    this.relabel();
     refreshStartButton();
   }
 
@@ -168,7 +191,7 @@ class Picker {
   }
 
   async load() {
-    this.listing.innerHTML = '<li class="loading">Loading…</li>';
+    this.listing.innerHTML = `<li class="loading">${escapeHtml(t('picker.loading'))}</li>`;
     this.renderCrumbs();
     try {
       const data = await api(`${this.endpoint}?parent=${encodeURIComponent(this.current.id)}`);
@@ -195,8 +218,10 @@ class Picker {
     }
     for (const file of data.files) {
       const tag = file.needs_conversion
-        ? '<span class="tag">converts to Office</span>'
-        : (file.is_shortcut ? '<span class="tag">shortcut</span>' : '');
+        ? `<span class="tag">${escapeHtml(t('picker.needsConversion'))}</span>`
+        : (file.is_shortcut
+            ? `<span class="tag">${escapeHtml(t('picker.shortcut'))}</span>`
+            : '');
       rows.push(
         `<li class="file">` +
         `<span class="icon">\u{1F4C4}</span>` +
@@ -205,7 +230,9 @@ class Picker {
         `</li>`
       );
     }
-    if (!rows.length) rows.push('<li class="empty-row">This folder is empty.</li>');
+    if (!rows.length) {
+      rows.push(`<li class="empty-row">${escapeHtml(t('picker.empty'))}</li>`);
+    }
     this.listing.innerHTML = rows.join('');
 
     $$('li.folder', this.listing).forEach((row) => {
@@ -240,15 +267,15 @@ class Picker {
   select(id, name) {
     this.selected = { id, name, path: this.stack.map((e) => e.name).join('/') };
     this.pickedBox.classList.add('set');
-    this.pickedBox.innerHTML = `Selected: <strong>${escapeHtml(this.selected.path)}</strong>`;
+    this.relabel();
     refreshStartButton();
   }
 
   async createFolder() {
     const name = await modal.open({
-      title: 'New OneDrive folder',
-      placeholder: 'Folder name',
-      okLabel: 'Create',
+      title: t('modal.newFolder'),
+      placeholder: t('modal.folderName'),
+      okLabel: t('modal.create'),
     });
     if (!name) return;
     try {
@@ -259,13 +286,16 @@ class Picker {
       );
       if (result.renamed_because && result.renamed_because.length) {
         banner.show(
-          `Created as "${result.folder.name}" — ${result.renamed_because.join('; ')}.`,
+          t('modal.createdAs', {
+            name: result.folder.name,
+            reasons: result.renamed_because.join('; '),
+          }),
           'warn'
         );
       }
       this.load();
     } catch (error) {
-      banner.show(`Could not create the folder: ${error.message}`, 'error', false);
+      banner.show(t('modal.createFailed', { error: error.message }), 'error', false);
     }
   }
 }
@@ -290,12 +320,7 @@ function applyDirection(next, { reload = true } = {}) {
   destPicker.configure(sides.dest);
 
   if (direction === 'onedrive_to_gdrive' && connected.google && !googleCanWrite) {
-    banner.show(
-      'Google Drive is connected with read-only access. Disconnect it in step 2 ' +
-      'and connect again to transfer files into Drive.',
-      'warn',
-      false
-    );
+    banner.show(t('warn.readonlyDirection'), 'warn', false);
     readonlyWarningShown = true;
   } else if (readonlyWarningShown) {
     // Only clear our own message; the banner may be showing something else,
@@ -353,11 +378,11 @@ function renderSetupProvider(provider, entry) {
 
   if (entry.configured) {
     state.className = 'pill pill-on';
-    state.textContent = entry.source === 'env' ? 'set by environment' : 'ready';
+    state.textContent = t(entry.source === 'env' ? 'setup.state.env' : 'setup.state.ready');
     clear.hidden = entry.source === 'env';
   } else {
     state.className = 'pill pill-idle';
-    state.textContent = 'not set up';
+    state.textContent = t('setup.state.notSetUp');
     clear.hidden = true;
   }
 
@@ -375,7 +400,7 @@ function applySetupCollapse(complete) {
   // and let the page lead with the transfer rather than the paperwork.
   const hide = complete && setupCollapsed;
   body.hidden = hide;
-  toggle.textContent = hide ? 'Show' : 'Hide';
+  toggle.textContent = t(hide ? 'setup.show' : 'setup.hide');
 }
 
 async function loadSetup() {
@@ -388,16 +413,16 @@ async function loadSetup() {
     const pill = $('#setup-pill');
     if (payload.complete) {
       pill.className = 'pill pill-on';
-      pill.textContent = 'done';
+      pill.textContent = t('setup.pill.done');
     } else {
       pill.className = 'pill pill-off';
-      pill.textContent = 'needed';
+      pill.textContent = t('setup.pill.needed');
       setupCollapsed = false;
     }
     applySetupCollapse(payload.complete);
     return payload.complete;
   } catch (error) {
-    banner.show('Could not read the setup state: ' + error.message, 'error', false);
+    banner.show(t('error.setup', { error: error.message }), 'error', false);
     return false;
   }
 }
@@ -413,11 +438,43 @@ function wireSetupCard(provider) {
       const field = $('[data-role="redirect"]', card);
       try {
         await navigator.clipboard.writeText(field.value);
-        copy.textContent = 'Copied';
-        setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+        copy.textContent = t('field.copied');
+        setTimeout(() => { copy.textContent = t('field.copy'); }, 1500);
       } catch {
         // Clipboard access can be refused; selecting the text still works.
         field.select();
+      }
+    });
+  }
+
+  // Google's Credentials page offers a "Download JSON" button. That file holds
+  // both values, so reading it beats asking anyone to transcribe a client ID.
+  const importField = $('[data-role="import"]', card);
+  if (importField) {
+    importField.addEventListener('change', async () => {
+      const file = importField.files && importField.files[0];
+      if (!file) return;
+      try {
+        const parsed = JSON.parse(await file.text());
+        const section = parsed.installed || parsed.web || parsed;
+        const clientId = (section.client_id || '').trim();
+        const clientSecret = (section.client_secret || '').trim();
+        if (!clientId) {
+          note.className = 'field-note bad';
+          note.textContent = t('import.bad');
+          return;
+        }
+        $('[data-role="client-id"]', card).value = clientId;
+        const secretField = $('[data-role="client-secret"]', card);
+        if (secretField) secretField.value = clientSecret;
+        note.className = 'field-note ok';
+        note.textContent = t('import.ok', { name: file.name });
+      } catch {
+        note.className = 'field-note bad';
+        note.textContent = t('import.unreadable');
+      } finally {
+        // Let the same file be chosen again after a correction.
+        importField.value = '';
       }
     });
   }
@@ -428,11 +485,11 @@ function wireSetupCard(provider) {
     const tenantField = $('[data-role="tenant"]', card);
     if (!clientId) {
       note.className = 'field-note bad';
-      note.textContent = 'A client ID is required.';
+      note.textContent = t('field.needClientId');
       return;
     }
     note.className = 'field-note';
-    note.textContent = 'Saving…';
+    note.textContent = t('field.saving');
     try {
       const result = await api('/api/setup/' + provider, {
         method: 'POST',
@@ -443,9 +500,7 @@ function wireSetupCard(provider) {
         }),
       });
       note.className = 'field-note ok';
-      note.textContent = result.public_client
-        ? 'Saved as a desktop registration (no secret needed).'
-        : 'Saved.';
+      note.textContent = t(result.public_client ? 'field.savedPublic' : 'field.saved');
       if (secretField) secretField.value = '';
       await loadSetup();
       await loadStatus();
@@ -456,7 +511,7 @@ function wireSetupCard(provider) {
   });
 
   $('[data-role="clear"]', card).addEventListener('click', async () => {
-    if (!confirm('Clear the saved ' + provider + ' application settings?')) return;
+    if (!confirm(t('field.confirmClear', { provider: PROVIDER_LABELS[provider] }))) return;
     try {
       await api('/api/setup/' + provider, { method: 'DELETE' });
       $('[data-role="client-id"]', card).value = '';
@@ -495,13 +550,13 @@ function renderAccount(provider, info, isConfigured) {
 
   if (info) {
     state.className = 'pill pill-on';
-    state.textContent = 'connected';
+    state.textContent = t('account.connected');
     who.textContent = info.label || '';
     connect.hidden = true;
     disconnect.hidden = false;
   } else {
     state.className = isConfigured ? 'pill pill-off' : 'pill pill-idle';
-    state.textContent = isConfigured ? 'not connected' : 'finish step 1 first';
+    state.textContent = t(isConfigured ? 'account.notConnected' : 'account.finishSetup');
     who.textContent = '';
     // Offering "Connect" before an application exists only leads to an error.
     connect.hidden = !isConfigured;
@@ -524,17 +579,18 @@ async function loadStatus() {
     if (connected[providerToAccount(sides.dest)]) destPicker.enable();
     refreshStartButton();
   } catch (error) {
-    banner.show(`Could not read status: ${error.message}`, 'error', false);
+    banner.show(t('error.status', { error: error.message }), 'error', false);
   }
 }
 
 $$('[data-role="disconnect"]').forEach((button) => {
   button.addEventListener('click', async () => {
     const provider = button.closest('.account').id.replace('acct-', '');
-    if (!confirm(`Disconnect ${provider}? Stored tokens for it are deleted.`)) return;
+    const label = PROVIDER_LABELS[provider] || provider;
+    if (!confirm(t('account.confirmDisconnect', { provider: label }))) return;
     try {
       await api(`/api/accounts/${provider}/disconnect`, { method: 'POST' });
-      banner.show(`${provider} disconnected.`);
+      banner.show(t('account.disconnected', { provider: label }));
       loadStatus();
     } catch (error) {
       banner.show(error.message, 'error', false);
@@ -548,23 +604,24 @@ function refreshStartButton() {
   const button = $('#start');
   const hint = $('#start-hint');
   const reasons = [];
-  if (!configured.google || !configured.microsoft) reasons.push('finish the setup step');
-  if (!connected.google) reasons.push('connect Google Drive');
-  if (!connected.microsoft) reasons.push('connect OneDrive');
-  if (!sourcePicker.selected) reasons.push('pick a source folder');
-  if (!destPicker.selected) reasons.push('pick a destination folder');
+  if (!configured.google || !configured.microsoft) reasons.push(t('reason.setup'));
+  if (!connected.google) reasons.push(t('reason.connectGoogle'));
+  if (!connected.microsoft) reasons.push(t('reason.connectOnedrive'));
+  if (!sourcePicker.selected) reasons.push(t('reason.pickSource'));
+  if (!destPicker.selected) reasons.push(t('reason.pickDest'));
   if (direction === 'onedrive_to_gdrive' && connected.google && !googleCanWrite) {
-    reasons.push('reconnect Google Drive for write access');
+    reasons.push(t('reason.reconnectGoogle'));
   }
 
   if (reasons.length) {
     button.disabled = true;
-    hint.textContent = `To start: ${reasons.join(', ')}.`;
+    hint.textContent = t('start.hint', { reasons: reasons.join(', ') });
   } else {
     button.disabled = false;
-    hint.textContent =
-      `${sourcePicker.selected.path} → ${destPicker.selected.path}. ` +
-      `Files are counted first, then moved.`;
+    hint.textContent = t('start.ready', {
+      source: sourcePicker.selected.path,
+      dest: destPicker.selected.path,
+    });
   }
 }
 
@@ -586,11 +643,11 @@ $('#start').addEventListener('click', async () => {
         start_immediately: true,
       }),
     });
-    banner.show(`Transfer #${job.id} started. Counting files…`);
+    banner.show(t('start.started', { id: job.id }));
     expanded.add(job.id);
     await refreshJobs();
   } catch (error) {
-    banner.show(`Could not start: ${error.message}`, 'error', false);
+    banner.show(t('start.failed', { error: error.message }), 'error', false);
   } finally {
     refreshStartButton();
   }
@@ -611,15 +668,21 @@ function jobCard(job) {
   const active = ['running', 'pending', 'planning'].includes(job.status);
 
   const stats = [
-    `${job.done_files}/${job.total_files} files`,
-    `${bytes(job.done_bytes)} of ${bytes(job.total_bytes)}`,
+    t('job.files', { done: job.done_files, total: job.total_files }),
+    t('job.bytes', { done: bytes(job.done_bytes), total: bytes(job.total_bytes) }),
   ];
-  if (job.rate_bytes_per_second) stats.push(`${bytes(job.rate_bytes_per_second)}/s`);
-  if (job.eta_seconds !== null && job.eta_seconds !== undefined && active) {
-    stats.push(`~${duration(job.eta_seconds)} left`);
+  if (job.rate_bytes_per_second) {
+    stats.push(t('job.rate', { rate: bytes(job.rate_bytes_per_second) }));
   }
-  if (job.failed_files) stats.push(`<span class="bad">${job.failed_files} failed</span>`);
-  if (job.skipped_files) stats.push(`<span class="warn">${job.skipped_files} skipped</span>`);
+  if (job.eta_seconds !== null && job.eta_seconds !== undefined && active) {
+    stats.push(t('job.eta', { time: duration(job.eta_seconds) }));
+  }
+  if (job.failed_files) {
+    stats.push(`<span class="bad">${escapeHtml(t('job.failed', { n: job.failed_files }))}</span>`);
+  }
+  if (job.skipped_files) {
+    stats.push(`<span class="warn">${escapeHtml(t('job.skipped', { n: job.skipped_files }))}</span>`);
+  }
 
   const activeRows = (job.active_files || []).map((file) => {
     const filePct = file.total ? Math.round((file.bytes_done / file.total) * 100) : 0;
@@ -630,23 +693,23 @@ function jobCard(job) {
 
   const actions = [];
   if (job.running) {
-    actions.push('<button class="btn btn-small" data-act="pause">Pause</button>');
-    actions.push('<button class="btn btn-small btn-danger" data-act="cancel">Cancel</button>');
+    actions.push(`<button class="btn btn-small" data-act="pause">${escapeHtml(t('job.pause'))}</button>`);
+    actions.push(`<button class="btn btn-small btn-danger" data-act="cancel">${escapeHtml(t('job.cancel'))}</button>`);
   } else if (['paused', 'pending', 'failed', 'cancelled'].includes(job.status)) {
-    actions.push('<button class="btn btn-small btn-primary" data-act="start">Resume</button>');
+    actions.push(`<button class="btn btn-small btn-primary" data-act="start">${escapeHtml(t('job.resume'))}</button>`);
   }
   if (job.failed_files && !job.running) {
-    actions.push('<button class="btn btn-small" data-act="retry">Retry failed</button>');
+    actions.push(`<button class="btn btn-small" data-act="retry">${escapeHtml(t('job.retry'))}</button>`);
   }
   if (job.total_files) {
     actions.push(`<button class="btn btn-small" data-act="toggle">${
-      expanded.has(job.id) ? 'Hide files' : 'Show files'}</button>`);
+      escapeHtml(t(expanded.has(job.id) ? 'job.hideFiles' : 'job.showFiles'))}</button>`);
     actions.push(
-      `<a class="btn btn-small" href="/api/jobs/${job.id}/report?fmt=csv">Download report</a>`
+      `<a class="btn btn-small" href="/api/jobs/${job.id}/report?fmt=csv">${escapeHtml(t('job.report'))}</a>`
     );
   }
   if (!job.running) {
-    actions.push('<button class="btn btn-small btn-quiet" data-act="delete">Delete</button>');
+    actions.push(`<button class="btn btn-small btn-quiet" data-act="delete">${escapeHtml(t('job.delete'))}</button>`);
   }
 
   return `
@@ -675,8 +738,8 @@ function renderTasks(container, payload) {
     else if (task.verified === false) verified = '<span class="vbad" title="hash mismatch">✗</span>';
 
     const notes = [];
-    if (task.renamed) notes.push(`renamed from "${task.source_name}"`);
-    if (task.converted_to) notes.push('converted to an Office format');
+    if (task.renamed) notes.push(t('table.renamedFrom', { name: task.source_name }));
+    if (task.converted_to) notes.push(t('table.converted'));
     if (task.error) notes.push(task.error);
     else if (task.hash_note && task.verified === false) notes.push(task.hash_note);
 
@@ -692,16 +755,16 @@ function renderTasks(container, payload) {
   const shown = payload.tasks.length;
   container.innerHTML = `
     <table>
-      <thead><tr><th>Status</th><th>Destination</th><th>Size</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="4">No files.</td></tr>'}</tbody>
+      <thead><tr><th>${escapeHtml(t('table.status'))}</th><th>${escapeHtml(t('table.destination'))}</th><th>${escapeHtml(t('table.size'))}</th><th></th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4">${escapeHtml(t('table.noFiles'))}</td></tr>`}</tbody>
     </table>
     ${shown < payload.total
-      ? `<p class="why">Showing ${shown} of ${payload.total}. Download the report for the full list.</p>`
+      ? `<p class="why">${escapeHtml(t('table.showing', { shown, total: payload.total }))}</p>`
       : ''}`;
 }
 
 async function loadTasks(jobId, container) {
-  container.innerHTML = '<p class="why">Loading…</p>';
+  container.innerHTML = `<p class="why">${escapeHtml(t('picker.loading'))}</p>`;
   try {
     const payload = await api(`/api/jobs/${jobId}/tasks?limit=200`);
     taskCache.set(jobId, payload);
@@ -731,12 +794,12 @@ function wireJobCard(card) {
           return;
         }
         if (act === 'delete') {
-          if (!confirm(`Delete transfer #${jobId}? Files already in OneDrive stay there.`)) return;
+          if (!confirm(t('job.confirmDelete', { id: jobId }))) return;
           await api(`/api/jobs/${jobId}`, { method: 'DELETE' });
           expanded.delete(jobId);
         } else if (act === 'retry') {
           const result = await api(`/api/jobs/${jobId}/retry-failed`, { method: 'POST' });
-          banner.show(`Re-queued ${result.requeued} failed file(s).`);
+          banner.show(t('job.requeued', { n: result.requeued }));
         } else {
           await api(`/api/jobs/${jobId}/${act}`, { method: 'POST' });
         }
@@ -755,7 +818,7 @@ async function refreshJobs() {
   try {
     const { jobs } = await api('/api/jobs?limit=25');
     if (!jobs.length) {
-      box.innerHTML = '<p class="empty">No transfers yet.</p>';
+      box.innerHTML = `<p class="empty">${escapeHtml(t('jobs.empty'))}</p>`;
       return;
     }
 
@@ -790,10 +853,36 @@ async function refreshJobs() {
 
 // ---------------------------------------------------------------- boot
 
+function renderChrome() {
+  const body = document.body;
+  $('#tagline').textContent = t('app.tagline', { size: body.dataset.chunkMib });
+  $('#meta').textContent = t('app.meta', {
+    version: body.dataset.version,
+    parallel: body.dataset.parallel,
+  });
+  $('#lang-toggle').textContent = t('lang.switch');
+}
+
+$('#lang-toggle').addEventListener('click', () => setLanguage(otherLanguage()));
+
+// Re-render everything that was built from strings rather than markup.
+document.addEventListener('languagechange-app', async () => {
+  renderChrome();
+  sourcePicker.relabel();
+  destPicker.relabel();
+  applySetupCollapse(!$('#setup-toggle').hidden);
+  await loadSetup();
+  await loadStatus();
+  await refreshJobs();
+});
+
 (function boot() {
+  applyTranslations();
+  renderChrome();
+
   const params = new URLSearchParams(location.search);
   if (params.get('connected')) {
-    banner.show(`${params.get('connected')} connected.`);
+    banner.show(t('connected.banner', { provider: params.get('connected') }));
     history.replaceState({}, '', location.pathname);
   } else if (params.get('error')) {
     banner.show(params.get('error'), 'error', false);

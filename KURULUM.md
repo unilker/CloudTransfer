@@ -8,6 +8,14 @@ yoktur, yarım dosya kalmaz.
 Yön, arayüzdeki bir düğmeyle seçilir: **Google Drive → OneDrive** ya da
 **OneDrive → Google Drive**.
 
+> **Arayüz Türkçedir.** Tarayıcınızın dili Türkçeyse program kendiliğinden
+> Türkçe açılır; sağ üstteki düğmeyle İngilizceye geçebilirsiniz.
+
+> **Şifreyle giriş neden yok?** Google ve Microsoft, programların e-posta ve
+> şifreyle giriş yapmasına izin vermiyor; bu güvenlik gerekçesiyle kapatıldı ve
+> dosya servisleri yalnızca yetki jetonu kabul ediyor. Bu yüzden aşağıdaki
+> uygulama kaydı adımı zorunlu — ama yalnızca bir kez yapılır.
+
 > **Önemli:** İki bulutu birbiriyle doğrudan konuşturmak mümkün değil. Google
 > Drive'ın "şu adrese gönder" diye bir API'si yok; Microsoft'un "URL'den yükle"
 > özelliği ise geri çekildi. Bu yüzden baytların bir aracıdan geçmesi gerekiyor.
@@ -68,8 +76,12 @@ verilemiyor.
 2. **APIs & Services → Library** → **Google Drive API**'yi etkinleştirin.
 3. **OAuth consent screen** → External → kendinizi test kullanıcısı ekleyin.
 4. **Credentials → Create credentials → OAuth client ID → Desktop app.**
-5. Çıkan **Client ID** ve **Client secret** değerlerini programdaki 1. adıma
-   yapıştırıp **Save** deyin.
+5. Google size bir **Download JSON** düğmesi gösterir. O dosyayı kaydedin.
+6. Programdaki 1. adımda **Dosya seç…** deyip o dosyayı gösterin — Client ID ve
+   Client secret kutuları kendiliğinden dolar. Sonra **Kaydet**.
+
+   (İsterseniz iki değeri elle de yapıştırabilirsiniz; JSON dosyası sadece
+   yazım hatası ihtimalini ortadan kaldırır.)
 
 Kullanılan izin `https://www.googleapis.com/auth/drive`'dır. Tam erişim
 gerekiyor, çünkü dosyalar iki yönde de gidiyor: salt okuma izni Drive'dan

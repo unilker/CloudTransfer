@@ -601,3 +601,22 @@ code {
   .segmented { width: 100%; }
   .segmented .seg { flex: 1; text-align: center; }
 }
+
+/* -- language switch and credential import ------------------------------ */
+
+.meta-row { display: flex; align-items: center; gap: 10px; }
+
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 11px 12px;
+  margin-bottom: 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.import-label { font-size: 13px; font-weight: 600; }
+.import-button { cursor: pointer; margin: 0; }
+.import-row .field-hint { flex-basis: 100%; }

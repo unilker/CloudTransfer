@@ -144,6 +144,9 @@ reused. Exit code is non-zero if any file failed.
 
 ## First run
 
+The interface is available in English and Turkish. It follows the browser's
+language and can be switched from the top right; the choice is remembered.
+
 The application walks you through this, and nothing needs editing in a file.
 Both providers require an application of your own before any program may reach
 your files. There is no way around that: an unverified third-party app cannot
@@ -155,7 +158,9 @@ be handed access to your Drive or OneDrive on your behalf.
 2. **APIs & Services -> Library** -> enable **Google Drive API**.
 3. **OAuth consent screen** -> External -> add yourself as a test user.
 4. **Credentials -> Create credentials -> OAuth client ID -> Desktop app.**
-5. Paste the client ID and secret into the setup step.
+5. Use Google's **Download JSON** button, then pick that file in the setup
+   step: it holds both values, so nothing has to be transcribed. Pasting the
+   client ID and secret by hand works too.
 
 Scope used: `https://www.googleapis.com/auth/drive`. Full access is needed
 because files travel both ways: read-only would be enough to send files to
@@ -341,6 +346,7 @@ a second, independently written implementation.
 | Area | File |
 |---|---|
 | Streaming, chunking, resume, verification | `tests/test_relay.py` |
+| Translation coverage, both languages | `tests/test_i18n.py` |
 | OneDrive to Google Drive, end to end | `tests/test_reverse.py` |
 | Drive's resumable upload protocol | `tests/test_gdrive_dest.py` |
 | PKCE, public clients, stored credentials | `tests/test_oauth.py` |
@@ -371,4 +377,5 @@ cloudtransfer/
     transfer.py      the relay itself
     worker.py        job execution, pause and resume
   web/               FastAPI app, REST API, interface
+    static/i18n.js   interface text, English and Turkish
 ```
