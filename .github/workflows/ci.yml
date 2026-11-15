@@ -81,3 +81,21 @@ jobs:
           } finally {
             if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
           }
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # Build the installer here too, not only on release. A broken installer
+      # script is otherwise invisible until the moment it matters, which is
+      # exactly how a pre-release version string once got through.
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          # Deliberately a pre-release-shaped version: VersionInfoVersion only
+          # takes numbers, so the suffix handling has to be exercised.
+          & $iscc "/DAppVersion=0.0.0-ci" "packaging\installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          $exe = Get-ChildItem dist\installer\*.exe | Select-Object -First 1
+          if (-not $exe) { throw "no installer was produced" }
+          Write-Host "installer: $($exe.Name), $([math]::Round($exe.Length / 1MB, 1)) MB"

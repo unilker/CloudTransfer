@@ -14,6 +14,20 @@
 #ifndef AppVersion
   #define AppVersion  "1.0.0"
 #endif
+
+; VersionInfoVersion accepts only one to four dot-separated numbers, so a
+; pre-release version such as "1.0.0-rc1" has to have its suffix stripped for
+; that one field. AppVersion keeps the full string, since that is what people
+; see and what names the installer file.
+#define DashPos Pos("-", AppVersion)
+#if DashPos == 1
+  #define NumericVersion "0.0.0"
+#elif DashPos > 1
+  #define NumericVersion Copy(AppVersion, 1, DashPos - 1)
+#else
+  #define NumericVersion AppVersion
+#endif
+
 #define AppPublisher  "CloudTransfer"
 #define AppExeName    "CloudTransfer.exe"
 #define AppId         "{{7C4F2E18-9B3A-4D62-9E4D-2F8A1C5B6D70}"
@@ -24,7 +38,8 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#NumericVersion}
+VersionInfoTextVersion={#AppVersion}
 
 ; Per-user install: no UAC prompt, no administrator account needed.
 PrivilegesRequired=lowest
