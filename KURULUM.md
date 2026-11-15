@@ -209,3 +209,18 @@ da başka bir portta çalışıyor demektir.
 - Her dosya aktarımdan sonra karma (hash) ile doğrulanır.
 - Program 8765 numaralı portu kullanır. Meşgulse bir üstünü dener; o durumda
   1. adımdaki yönlendirme adresi de değişir ve ekranda güncel hâli görünür.
+
+---
+
+## Yeni bir sürüm yayınlamak
+
+Terminal gerekmez, tarayıcıdan yapılır:
+
+1. Depoda sağdaki **Releases** bölümüne girin → **Draft a new release**.
+2. **Choose a tag** kutusuna sürümü yazın, örneğin `v1.3.0`, ve çıkan
+   **Create new tag: v1.3.0 on publish** satırına tıklayın.
+3. **Target** olarak `main` seçili olsun.
+4. İsterseniz bir başlık yazın, sonra **Publish release** deyin.
+
+Birkaç dakika içinde derleme çalışır ve kurulum dosyasını sağlamasıyla birlikte
+o yayın sayfasına ekler. İlerlemeyi **Actions** sekmesinden izleyebilirsiniz.

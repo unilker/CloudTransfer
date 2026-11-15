@@ -4,14 +4,21 @@ name: Release
 # to run on Windows - which is the whole reason the release is built here
 # rather than on a developer's machine.
 #
-# Publish a release by pushing a tag:
-#   git tag v1.0.0 && git push origin v1.0.0
+# Three ways in, so no route leaves someone stuck:
 #
-# Or run this workflow by hand to get an installer without tagging.
+#   * push a tag:   git tag v1.0.0 && git push origin v1.0.0
+#   * publish a release on github.com, which creates the tag for you
+#   * run this workflow by hand, for an installer without a release
+#
+# The release trigger is not redundant: a tag created through the Releases page
+# does not always raise a push event, and the installer never appearing on the
+# release is a confusing way to find that out.
 
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -21,6 +28,11 @@ on:
 
 permissions:
   contents: write
+
+# Both triggers can fire for one tag. Build it once rather than twice.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:

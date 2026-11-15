@@ -212,13 +212,20 @@ read-only, since they belong to the deployment rather than to one user.
 ## Building the installer
 
 PyInstaller cannot cross-compile, so a Windows installer has to be built on
-Windows. The repository does that in CI: push a tag and the workflow builds it,
-checks that the packaged executable really serves a page, and attaches the
+Windows. The repository does that in CI: tag a version and the workflow builds
+it, checks that the packaged executable really serves a page, and attaches the
 installer to a GitHub release.
+
+From a clone:
 
 ```bash
 git tag v1.0.1 && git push origin v1.0.1
 ```
+
+Or entirely in the browser, with no git at all: **Releases → Draft a new
+release → Choose a tag**, type the version, pick *Create new tag on publish*,
+target `main`, then **Publish release**. The workflow runs on either route and
+adds the installer to the release when it finishes.
 
 By hand, on a Windows machine:
 
