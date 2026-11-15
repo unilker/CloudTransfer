@@ -1,0 +1,39 @@
+# Run CloudTransfer in a container, so transfers never touch your own machine
+# or its bandwidth.
+#
+#   cp .env.example .env     # fill in the four OAuth values
+#   docker compose up -d
+#   open http://localhost:8080
+#
+# Deploying somewhere public: set CT_BASE_URL to the https:// address, put a
+# TLS terminator in front, and register that same address as the OAuth redirect
+# URI with both Google and Microsoft.
+
+services:
+  cloudtransfer:
+    build: .
+    image: cloudtransfer:1.0.0
+    container_name: cloudtransfer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CT_DATA_DIR: /data
+      CT_HOST: 0.0.0.0
+      CT_PORT: 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      # Holds the job database and the generated secret key. Keeping it means
+      # paused transfers and connected accounts survive a restart.
+      - cloudtransfer-data:/data
+    # Peak memory is roughly CT_CHUNK_SIZE * CT_MAX_PARALLEL_FILES * 2. With
+    # the 10 MiB / 3 files defaults, 512 MiB is comfortable.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  cloudtransfer-data:

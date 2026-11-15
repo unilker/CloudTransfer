@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudTransfer</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9729;</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">&#9729;</span>
+    <div>
+      <h1>CloudTransfer</h1>
+      <p class="tagline">Google Drive &rarr; OneDrive, streamed in {{ "%.0f"|format(chunk_size / 1048576) }} MiB chunks. Nothing is written to disk.</p>
+    </div>
+  </div>
+  <div class="meta">v{{ version }} &middot; {{ parallel }} files in parallel</div>
+</header>
+
+<main>
+  <div id="banner" class="banner" hidden></div>
+
+  <!-- 1. Accounts ------------------------------------------------------- -->
+  <section class="card">
+    <h2><span class="step">1</span> Connect both accounts</h2>
+    <div class="accounts">
+      <div class="account" id="acct-google">
+        <div class="account-head">
+          <strong>Google Drive</strong>
+          <span class="pill pill-idle" data-role="state">checking&hellip;</span>
+        </div>
+        <p class="account-who" data-role="who"></p>
+        <p class="account-note">Read-only access. This app never modifies your Drive.</p>
+        <div class="account-actions">
+          <a class="btn btn-primary" data-role="connect" href="/auth/google/start">Connect</a>
+          <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
+        </div>
+        {% if not google_configured %}
+        <p class="account-warn">Not configured. Set <code>CT_GOOGLE_CLIENT_ID</code> and
+          <code>CT_GOOGLE_CLIENT_SECRET</code>, with redirect URI
+          <code>{{ google_redirect }}</code>.</p>
+        {% endif %}
+      </div>
+
+      <div class="account" id="acct-microsoft">
+        <div class="account-head">
+          <strong>OneDrive</strong>
+          <span class="pill pill-idle" data-role="state">checking&hellip;</span>
+        </div>
+        <p class="account-who" data-role="who"></p>
+        <p class="account-note">Read and write, so files can be created.</p>
+        <div class="account-actions">
+          <a class="btn btn-primary" data-role="connect" href="/auth/microsoft/start">Connect</a>
+          <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
+        </div>
+        {% if not ms_configured %}
+        <p class="account-warn">Not configured. Set <code>CT_MS_CLIENT_ID</code> and
+          <code>CT_MS_CLIENT_SECRET</code>, with redirect URI
+          <code>{{ ms_redirect }}</code>.</p>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. Pick folders --------------------------------------------------- -->
+  <section class="card" id="pick-section">
+    <h2><span class="step">2</span> Choose what moves where</h2>
+    <div class="pickers">
+      <div class="picker" id="picker-source">
+        <div class="picker-head">
+          <h3>From Google Drive</h3>
+          <button class="btn btn-small" data-role="up">&uarr; Up</button>
+        </div>
+        <nav class="crumbs" data-role="crumbs"></nav>
+        <ul class="listing" data-role="listing"></ul>
+        <div class="picked" data-role="picked">Nothing selected</div>
+      </div>
+
+      <div class="picker" id="picker-dest">
+        <div class="picker-head">
+          <h3>To OneDrive</h3>
+          <span>
+            <button class="btn btn-small" data-role="newfolder">+ Folder</button>
+            <button class="btn btn-small" data-role="up">&uarr; Up</button>
+          </span>
+        </div>
+        <nav class="crumbs" data-role="crumbs"></nav>
+        <ul class="listing" data-role="listing"></ul>
+        <div class="picked" data-role="picked">Nothing selected</div>
+      </div>
+    </div>
+
+    <div class="options">
+      <label>
+        If a file of the same name is already there
+        <select id="conflict">
+          <option value="rename">Keep both (add a number)</option>
+          <option value="replace">Replace it</option>
+          <option value="skip">Leave it and skip</option>
+        </select>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="verify" checked>
+        Verify every file by hash after transfer
+      </label>
+      <label class="check">
+        <input type="checkbox" id="trashed">
+        Include files in Drive's trash
+      </label>
+    </div>
+
+    <div class="start-row">
+      <button class="btn btn-go" id="start" disabled>Start transfer</button>
+      <span class="start-hint" id="start-hint">Connect both accounts and pick a source folder.</span>
+    </div>
+  </section>
+
+  <!-- 3. Jobs ----------------------------------------------------------- -->
+  <section class="card">
+    <h2><span class="step">3</span> Transfers</h2>
+    <div id="jobs" class="jobs"><p class="empty">No transfers yet.</p></div>
+  </section>
+
+  <details class="card notes">
+    <summary>How this works, and what it cannot do</summary>
+    <div class="notes-body">
+      <p><strong>No local copy.</strong> Each file is read from Drive in byte
+      ranges, held one chunk at a time in memory, and pushed straight into a
+      OneDrive upload session. Nothing reaches a filesystem, so there is no
+      temporary folder and no partial file left behind.</p>
+
+      <p><strong>Bytes still travel through this process.</strong> A true
+      cloud-to-cloud copy is not possible: Google Drive offers no &ldquo;send to
+      URL&rdquo; API, and Microsoft retired its &ldquo;upload from URL&rdquo;
+      feature. Something has to relay. Run this app on a server or container and
+      your own machine carries no traffic at all.</p>
+
+      <p><strong>Google Docs, Sheets and Slides are converted.</strong> Native
+      Google formats have no bytes to copy, so they are exported to
+      .docx/.xlsx/.pptx on the way out. Google caps that export at 10&nbsp;MB,
+      and files above it are reported as skipped rather than silently dropped.</p>
+
+      <p><strong>Interrupted transfers resume.</strong> OneDrive remembers how
+      much of each upload it holds. After a pause, a crash or a network drop,
+      each file continues from that exact byte instead of starting over.</p>
+
+      <p><strong>Renames are recorded, never silent.</strong> Characters
+      OneDrive rejects, duplicate names in one folder and reserved names are all
+      rewritten, and every change appears in the job report.</p>
+    </div>
+  </details>
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <h3 id="modal-title">New folder</h3>
+    <input type="text" id="modal-input" placeholder="Folder name" autocomplete="off">
+    <p class="modal-error" id="modal-error" hidden></p>
+    <div class="modal-actions">
+      <button class="btn btn-quiet" id="modal-cancel">Cancel</button>
+      <button class="btn btn-primary" id="modal-ok">Create</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

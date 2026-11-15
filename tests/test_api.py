@@ -1,0 +1,411 @@
+"""The HTTP surface, driven in-process against the in-memory providers."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from cloudtransfer.config import ONEDRIVE_CHUNK_MULTIPLE, get_settings
+from cloudtransfer.crypto import encrypt
+from cloudtransfer.db import dispose_db, session_scope
+from cloudtransfer.models import Account, Job
+
+
+@pytest.fixture
+async def api(tmp_path, drive, onedrive, monkeypatch):
+    """A running app whose providers are the fakes and whose DB is temporary."""
+    monkeypatch.setenv("CT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("CT_SECRET_KEY", "api-test-secret")
+    monkeypatch.setenv("CT_CHUNK_SIZE", str(ONEDRIVE_CHUNK_MULTIPLE * 2))
+    monkeypatch.setenv("CT_SIMPLE_UPLOAD_MAX", str(ONEDRIVE_CHUNK_MULTIPLE // 2))
+    monkeypatch.setenv("CT_GOOGLE_CLIENT_ID", "gid")
+    monkeypatch.setenv("CT_GOOGLE_CLIENT_SECRET", "gsecret")
+    monkeypatch.setenv("CT_MS_CLIENT_ID", "mid")
+    monkeypatch.setenv("CT_MS_CLIENT_SECRET", "msecret")
+    get_settings.cache_clear()
+    await dispose_db()
+
+    async def token() -> str:
+        return "token"
+
+    from cloudtransfer.engine import worker as worker_module
+    from cloudtransfer.web import deps
+    from cloudtransfer.web.app import create_app
+
+    monkeypatch.setattr(worker_module, "GoogleDriveSource", lambda *a, **k: drive)
+    monkeypatch.setattr(worker_module, "OneDriveDest", lambda *a, **k: onedrive)
+    monkeypatch.setattr(
+        worker_module, "TokenManager", lambda *a, **k: SimpleNamespace(get_token=token)
+    )
+    worker_module._runner = None
+
+    app = create_app()
+    app.dependency_overrides[deps.drive_source] = lambda: drive
+    app.dependency_overrides[deps.onedrive_dest] = lambda: onedrive
+
+    async with app.router.lifespan_context(app):
+        # Both accounts connected: the state every transfer endpoint expects.
+        # Writing the rows directly also exercises the real token encryption.
+        settings = get_settings()
+        secret = settings.resolve_secret_key()
+        async with session_scope(settings) as session:
+            for provider, email in (
+                ("google", "tester@example.com"),
+                ("microsoft", "tester@contoso.example"),
+            ):
+                session.add(
+                    Account(
+                        provider=provider,
+                        display_name="Tester",
+                        email=email,
+                        access_token_enc=encrypt(secret, "access-token"),
+                        refresh_token_enc=encrypt(secret, "refresh-token"),
+                        expires_at=time.time() + 3600,
+                        scope="",
+                    )
+                )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+
+    await dispose_db()
+    get_settings.cache_clear()
+    worker_module._runner = None
+
+
+async def _await_job(client, job_id, timeout=30.0):
+    """Poll until the job leaves its active states."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        payload = (await client.get(f"/api/jobs/{job_id}")).json()
+        if not payload["running"] and payload["status"] not in (
+            "pending", "planning", "running"
+        ):
+            return payload
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish: {payload}")
+
+
+# --------------------------------------------------------------------- basics
+
+
+async def test_health_and_index(api):
+    assert (await api.get("/healthz")).json()["status"] == "ok"
+    page = await api.get("/")
+    assert page.status_code == 200
+    assert "CloudTransfer" in page.text
+
+
+async def test_status_lists_accounts_and_redirect_uris(api):
+    payload = (await api.get("/api/status")).json()
+    assert payload["configured"] == {"google": True, "microsoft": True}
+    assert payload["google"]["email"] == "tester@example.com"
+    assert payload["microsoft"]["label"] == "tester@contoso.example"
+    assert payload["redirect_uris"]["google"].endswith("/auth/google/callback")
+    assert payload["transfer"]["chunk_size"] == ONEDRIVE_CHUNK_MULTIPLE * 2
+
+
+async def test_disconnecting_an_account_blocks_new_transfers(api, onedrive):
+    assert (await api.post("/api/accounts/google/disconnect")).json()["disconnected"] is True
+    assert (await api.get("/api/status")).json()["google"] is None
+
+    blocked = await api.post(
+        "/api/jobs",
+        json={"source_folder_id": "root", "dest_folder_id": onedrive.root.id},
+    )
+    assert blocked.status_code == 409
+    assert "not connected" in blocked.json()["detail"]
+
+    # Disconnecting twice is harmless.
+    assert (await api.post("/api/accounts/google/disconnect")).json()["disconnected"] is False
+
+
+async def test_unknown_provider_is_rejected(api):
+    assert (await api.get("/auth/nope/start")).status_code == 404
+
+
+async def test_authorize_redirect_carries_the_right_scopes(api):
+    response = await api.get("/auth/google/start", follow_redirects=False)
+    assert response.status_code == 307
+    location = response.headers["location"]
+    assert "accounts.google.com" in location
+    assert "drive.readonly" in location
+    # Without these, Google issues no refresh token and the app dies in an hour.
+    assert "access_type=offline" in location
+    assert "prompt=consent" in location
+
+
+async def test_microsoft_authorize_requests_offline_access(api):
+    response = await api.get("/auth/microsoft/start", follow_redirects=False)
+    location = response.headers["location"]
+    assert "login.microsoftonline.com" in location
+    assert "offline_access" in location
+    assert "Files.ReadWrite" in location
+
+
+async def test_callback_rejects_a_mismatched_state(api):
+    """Guards against someone else's redirect being replayed at us."""
+    response = await api.get("/auth/google/callback?code=abc&state=not-the-one")
+    assert response.status_code == 400
+    assert "state did not match" in response.json()["detail"]
+
+
+# -------------------------------------------------------------------- browsing
+
+
+async def test_browsing_drive_separates_folders_from_files(api, drive):
+    drive.add_folder("Photos")
+    drive.add_file("a.txt", b"hello")
+    drive.add_native("Doc", "application/vnd.google-apps.document", {})
+
+    payload = (await api.get("/api/browse/drive?parent=root")).json()
+    assert [f["name"] for f in payload["folders"]] == ["Photos"]
+    names = {f["name"]: f for f in payload["files"]}
+    assert names["a.txt"]["needs_conversion"] is False
+    assert names["Doc"]["needs_conversion"] is True  # the UI warns about this
+
+
+async def test_browsing_onedrive_resolves_root(api, onedrive):
+    await onedrive.ensure_folder(onedrive.root.id, "Target")
+    payload = (await api.get("/api/browse/onedrive?parent=root")).json()
+    assert payload["parent"]["id"] == onedrive.root.id
+    assert [f["name"] for f in payload["folders"]] == ["Target"]
+
+
+async def test_creating_a_destination_folder_sanitizes_the_name(api, onedrive):
+    response = await api.post(
+        f"/api/browse/onedrive/folder?parent={onedrive.root.id}&name=bad%3Aname"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["folder"]["name"] == "bad_name"
+    assert payload["renamed_because"]
+
+
+async def test_quota_is_exposed(api, onedrive):
+    payload = (await api.get("/api/browse/onedrive/quota")).json()
+    assert payload["remaining"] == onedrive.quota_remaining
+
+
+# ------------------------------------------------------------------ transfers
+
+
+async def test_a_job_runs_end_to_end_over_http(api, drive, onedrive, payload_factory):
+    folder = drive.add_folder("Docs")
+    big = payload_factory(ONEDRIVE_CHUNK_MULTIPLE * 3)
+    drive.add_file("readme.txt", b"hello world")
+    drive.add_file("data.bin", big, parent=folder.id)
+
+    created = await api.post(
+        "/api/jobs",
+        json={
+            "source_folder_id": "root",
+            "source_folder_name": "My Drive",
+            "dest_folder_id": onedrive.root.id,
+            "dest_folder_path": "OneDrive",
+            "conflict_policy": "rename",
+            "verify": True,
+            "start_immediately": True,
+        },
+    )
+    assert created.status_code == 200
+    job_id = created.json()["id"]
+
+    final = await _await_job(api, job_id)
+    assert final["status"] == "completed"
+    assert final["done_files"] == 2
+    assert onedrive.tree() == {"readme.txt": b"hello world", "Docs/data.bin": big}
+
+
+async def test_task_listing_shows_renames_and_verification(api, drive, onedrive):
+    drive.add_file("awkward:name.txt", b"x" * 100)
+
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+
+    payload = (await api.get(f"/api/jobs/{job_id}/tasks")).json()
+    assert payload["total"] == 1
+    task = payload["tasks"][0]
+    assert task["dest_name"] == "awkward_name.txt"
+    assert task["renamed"] is True
+    assert task["rename_notes"]
+    assert task["verified"] is True
+
+
+async def test_the_csv_report_covers_every_outcome(api, drive, onedrive):
+    drive.add_file("good.txt", b"fine")
+    drive.add_native("Survey", "application/vnd.google-apps.form", {})
+    drive.add_file("blocked.txt", b"nope")
+    onedrive.fail_permanently.add("blocked.txt")
+
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    final = await _await_job(api, job_id)
+    assert final["status"] == "completed_with_errors"
+
+    report = await api.get(f"/api/jobs/{job_id}/report?fmt=csv")
+    assert report.status_code == 200
+    assert "text/csv" in report.headers["content-type"]
+    assert "attachment" in report.headers["content-disposition"]
+    body = report.text
+    assert "good.txt" in body and "done" in body
+    assert "Google Forms" in body       # the skip reason
+    assert "access denied" in body      # the failure reason
+
+    as_json = (await api.get(f"/api/jobs/{job_id}/report?fmt=json")).json()
+    assert {t["status"] for t in as_json["tasks"]} == {"done", "skipped", "failed"}
+
+
+async def test_failed_files_can_be_requeued(api, drive, onedrive):
+    drive.add_file("blocked.txt", b"payload")
+    onedrive.fail_permanently.add("blocked.txt")
+
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+
+    onedrive.fail_permanently.clear()
+    response = await api.post(f"/api/jobs/{job_id}/retry-failed")
+    assert response.json()["requeued"] == 1
+
+    final = await _await_job(api, job_id)
+    assert final["status"] == "completed"
+    assert onedrive.tree() == {"blocked.txt": b"payload"}
+
+
+async def test_preflight_warns_when_the_destination_is_too_full(api, onedrive):
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": False,
+            },
+        )
+    ).json()["id"]
+
+    # Give the job a known size without moving anything, then shrink the quota.
+    async with session_scope(get_settings()) as session:
+        job = await session.get(Job, job_id)
+        job.total_bytes = 5_000_000
+        job.done_bytes = 0
+    onedrive.quota_remaining = 1000
+
+    payload = (await api.get(f"/api/jobs/{job_id}/preflight")).json()
+    assert payload["bytes_to_move"] == 5_000_000
+    assert payload["destination_remaining"] == 1000
+    assert payload["fits"] is False
+    assert "only 1000 bytes free" in payload["warning"]
+
+
+async def test_preflight_passes_when_there_is_room(api, onedrive):
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": False,
+            },
+        )
+    ).json()["id"]
+    payload = (await api.get(f"/api/jobs/{job_id}/preflight")).json()
+    assert payload["fits"] is True
+    assert payload["warning"] is None
+
+
+async def test_jobs_can_be_deleted_but_not_while_running(api, drive, onedrive):
+    drive.add_file("a.txt", b"a")
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+
+    assert (await api.delete(f"/api/jobs/{job_id}")).json()["deleted"] == job_id
+    assert (await api.get(f"/api/jobs/{job_id}")).status_code == 404
+
+
+async def test_missing_jobs_report_404(api):
+    assert (await api.get("/api/jobs/9999")).status_code == 404
+    assert (await api.get("/api/jobs/9999/tasks")).status_code == 404
+    assert (await api.post("/api/jobs/9999/start")).status_code == 404
+    assert (await api.delete("/api/jobs/9999")).status_code == 404
+
+
+async def test_pausing_an_idle_job_is_a_conflict(api, drive, onedrive):
+    drive.add_file("a.txt", b"a")
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+    assert (await api.post(f"/api/jobs/{job_id}/pause")).status_code == 409
+
+
+async def test_progress_events_stream_and_terminate(api, drive, onedrive):
+    drive.add_file("a.txt", b"a" * 50)
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+
+    # On a finished job the stream emits one frame and closes.
+    events: list[str] = []
+    async with api.stream("GET", f"/api/jobs/{job_id}/events") as response:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                events.append(line)
+                break
+    assert events and '"status": "completed"' in events[0]
