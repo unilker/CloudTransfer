@@ -12,7 +12,7 @@
 ; Overridable from the command line so a release build can carry the tag:
 ;   iscc /DAppVersion=1.2.3 packaging\installer.iss
 #ifndef AppVersion
-  #define AppVersion  "1.0.0"
+  #define AppVersion  "1.3.0"
 #endif
 
 ; VersionInfoVersion accepts only one to four dot-separated numbers, so a

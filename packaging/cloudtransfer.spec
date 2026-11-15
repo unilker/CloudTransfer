@@ -125,7 +125,7 @@ app = BUNDLE(
     icon=str(ICON_PNG) if ICON_PNG.exists() else None,
     bundle_identifier="dev.cloudtransfer.app",
     info_plist={
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleShortVersionString": "1.3.0",
         "LSBackgroundOnly": False,
         "NSHighResolutionCapable": True,
     },
