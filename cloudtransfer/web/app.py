@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from .. import __version__
+from ..appconfig import setup_status
 from ..config import Settings, get_settings
 from ..db import dispose_db, healthcheck, init_db
 from ..engine.worker import get_runner, reset_stale_jobs
@@ -47,11 +48,15 @@ async def lifespan(app: FastAPI):
         "CloudTransfer %s ready on %s (chunk %d bytes, %d files in parallel)",
         __version__, settings.base_url, settings.chunk_size, settings.max_parallel_files,
     )
-    if not settings.google_configured or not settings.ms_configured:
+    status = await setup_status(settings)
+    missing = [name for name, entry in status.items() if not entry["configured"]]
+    if missing:
+        # Deliberately no URL: the desktop launcher picks its own port, so the
+        # configured base_url would often name an address nothing is serving.
         log.warning(
-            "OAuth credentials are incomplete; set the values in .env "
-            "(google=%s, microsoft=%s)",
-            settings.google_configured, settings.ms_configured,
+            "Not set up yet for: %s. Open the interface and finish the setup "
+            "step; no file editing is required.",
+            ", ".join(missing),
         )
     try:
         yield
@@ -110,15 +115,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def index(request: Request):
+        # Setup state is fetched by the page itself, so it stays correct after
+        # the wizard is used without needing a reload.
         return TEMPLATES.TemplateResponse(
             request,
             "index.html",
             {
                 "version": __version__,
-                "google_configured": settings.google_configured,
-                "ms_configured": settings.ms_configured,
-                "google_redirect": settings.google_redirect_uri,
-                "ms_redirect": settings.ms_redirect_uri,
                 "chunk_size": settings.chunk_size,
                 "parallel": settings.max_parallel_files,
             },

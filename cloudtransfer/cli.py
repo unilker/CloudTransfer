@@ -25,6 +25,16 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _desktop(args: argparse.Namespace) -> int:
+    from .desktop import run_desktop
+
+    return run_desktop(
+        port=args.port,
+        open_browser=not args.no_browser,
+        tray=not args.no_tray,
+    )
+
+
 def _transfer(args: argparse.Namespace) -> int:
     """Run one job to completion without the web UI."""
     from .accounts import TokenManager, load_account
@@ -116,6 +126,15 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--reload", action="store_true", help="reload on code changes")
     serve.set_defaults(func=_serve)
 
+    desktop = sub.add_parser(
+        "desktop",
+        help="run as a desktop app: local server, browser, tray icon",
+    )
+    desktop.add_argument("--port", type=int, default=None)
+    desktop.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    desktop.add_argument("--no-tray", action="store_true", help="stay in the console")
+    desktop.set_defaults(func=_desktop)
+
     transfer = sub.add_parser("transfer", help="run one transfer headlessly")
     transfer.add_argument("--source", required=True, help="Google Drive folder ID")
     transfer.add_argument("--dest", required=True, help="OneDrive folder ID, or 'root'")
@@ -127,6 +146,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def main_desktop(argv: list[str] | None = None) -> int:
+    """Entry point for the packaged application.
+
+    Defaults to the desktop launcher so a double-clicked executable needs no
+    arguments, while still accepting the ordinary subcommands.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version"):
+        argv = ["desktop", *argv]
+    return main(argv)
 
 
 if __name__ == "__main__":  # pragma: no cover

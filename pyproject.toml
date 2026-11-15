@@ -18,9 +18,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.7"]
+# The tray icon for the packaged desktop build. The launcher falls back to a
+# console window when these are absent, so they stay optional.
+desktop = ["pystray>=0.19.5", "pillow>=10.4"]
+build = ["pyinstaller>=6.11"]
 
 [project.scripts]
 cloudtransfer = "cloudtransfer.cli:main"
+
+[project.gui-scripts]
+cloudtransfer-desktop = "cloudtransfer.cli:main_desktop"
 
 [build-system]
 requires = ["setuptools>=75"]

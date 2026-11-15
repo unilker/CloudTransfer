@@ -409,3 +409,116 @@ async def test_progress_events_stream_and_terminate(api, drive, onedrive):
                 events.append(line)
                 break
     assert events and '"status": "completed"' in events[0]
+
+
+# ---------------------------------------------------------------- setup API
+
+
+async def test_setup_reports_what_is_missing_and_where_to_point_it(api, monkeypatch):
+    """A fresh instance with no environment credentials: the desktop case."""
+    await api.delete("/api/setup/google")
+    await api.delete("/api/setup/microsoft")
+    monkeypatch.delenv("CT_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("CT_MS_CLIENT_ID", raising=False)
+    get_settings.cache_clear()
+
+    payload = (await api.get("/api/setup")).json()
+    assert payload["complete"] is False
+    google = payload["providers"]["google"]
+    assert google["configured"] is False
+    assert google["name"] == "Google Drive"
+    # The exact value to register, so nothing has to be guessed.
+    assert google["redirect_uri"].endswith("/auth/google/callback")
+    assert payload["providers"]["microsoft"]["redirect_uri"].endswith(
+        "/auth/microsoft/callback"
+    )
+
+
+async def test_saving_credentials_through_the_api(api):
+    response = await api.post(
+        "/api/setup/microsoft",
+        json={"client_id": "11111111-2222-3333-4444-555555555555", "client_secret": ""},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["public_client"] is True  # a desktop registration has no secret
+    assert body["has_secret"] is False
+
+    payload = (await api.get("/api/setup")).json()
+    assert payload["providers"]["microsoft"]["configured"] is True
+    assert payload["providers"]["microsoft"]["source"] == "stored"
+    assert payload["providers"]["microsoft"]["client_id"].startswith("11111111")
+
+
+async def test_a_saved_secret_is_never_returned(api):
+    """The setup page must be able to show state without leaking the secret."""
+    await api.post(
+        "/api/setup/google",
+        json={"client_id": "gid.apps.googleusercontent.com", "client_secret": "GOCSPX-abc"},
+    )
+    body = (await api.get("/api/setup")).text
+    assert "GOCSPX-abc" not in body
+    assert (await api.get("/api/setup")).json()["providers"]["google"]["has_secret"] is True
+
+
+async def test_an_empty_client_id_is_rejected(api):
+    response = await api.post(
+        "/api/setup/google", json={"client_id": "   ", "client_secret": ""}
+    )
+    assert response.status_code in (400, 422)
+
+
+async def test_setup_rejects_an_unknown_provider(api):
+    assert (
+        await api.post("/api/setup/dropbox", json={"client_id": "x"})
+    ).status_code == 404
+    assert (await api.delete("/api/setup/dropbox")).status_code == 404
+
+
+async def test_clearing_credentials_through_the_api(api):
+    await api.post("/api/setup/microsoft", json={"client_id": "mid", "client_secret": ""})
+    assert (await api.delete("/api/setup/microsoft")).json()["cleared"] is True
+    # Falls back to the environment, which this fixture sets.
+    assert (await api.get("/api/setup")).json()["providers"]["microsoft"]["source"] == "env"
+
+
+async def test_connecting_is_refused_before_setup(api, monkeypatch):
+    await api.delete("/api/setup/google")
+    monkeypatch.delenv("CT_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("CT_GOOGLE_CLIENT_SECRET", raising=False)
+    get_settings.cache_clear()
+
+    response = await api.get("/auth/google/start", follow_redirects=False)
+    assert response.status_code == 400
+    assert "not set up" in response.json()["detail"]
+
+
+async def test_the_authorize_redirect_uses_the_stored_application(api):
+    await api.post(
+        "/api/setup/google",
+        json={"client_id": "stored-client-id", "client_secret": "s"},
+    )
+    response = await api.get("/auth/google/start", follow_redirects=False)
+    assert response.status_code == 307
+
+    location = httpx.URL(response.headers["location"])
+    assert location.params["client_id"] == "stored-client-id"
+    # PKCE must be present: the desktop build ships its client ID publicly.
+    assert location.params["code_challenge_method"] == "S256"
+    assert location.params["code_challenge"]
+
+
+async def test_redirect_uris_follow_the_address_actually_used(api):
+    """The desktop build may land on a different port; the page must say so."""
+    payload = (await api.get("/api/setup", headers={"Host": "127.0.0.1:9999"})).json()
+    assert "127.0.0.1:9999" in payload["providers"]["google"]["redirect_uri"]
+
+
+async def test_an_explicit_base_url_wins_over_the_request(api, monkeypatch):
+    """Behind a proxy the request arrives as http; the configured address rules."""
+    monkeypatch.setenv("CT_BASE_URL", "https://transfer.example.com")
+    get_settings.cache_clear()
+    payload = (await api.get("/api/setup", headers={"Host": "127.0.0.1:9999"})).json()
+    assert payload["providers"]["google"]["redirect_uri"] == (
+        "https://transfer.example.com/auth/google/callback"
+    )

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import secrets
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -26,6 +28,32 @@ SIMPLE_UPLOAD_MAX = 4 * 1024 * 1024
 ONEDRIVE_MAX_FILE_SIZE = 250 * 1024 * 1024 * 1024
 
 
+APP_NAME = "CloudTransfer"
+
+
+def platform_data_dir(app_name: str = APP_NAME) -> Path:
+    """The per-user directory this platform expects application data in."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / app_name
+
+
+def default_data_dir() -> Path:
+    """Where to keep the database when nothing was configured.
+
+    A packaged build is installed somewhere read-only, such as Program Files,
+    so a relative ``./data`` would fail on first write. Running from a checkout
+    keeps it beside the source, which is what a developer expects.
+    """
+    if getattr(sys, "frozen", False):
+        return platform_data_dir()
+    return Path("./data")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CT_",
@@ -44,7 +72,7 @@ class Settings(BaseSettings):
     ms_tenant: str = "common"
 
     secret_key: str = ""
-    data_dir: Path = Path("./data")
+    data_dir: Path = Field(default_factory=default_data_dir)
 
     chunk_size: int = 10 * 1024 * 1024
     simple_upload_max: int = SIMPLE_UPLOAD_MAX
@@ -96,6 +124,17 @@ class Settings(BaseSettings):
         return v
 
     # -- derived ------------------------------------------------------------
+
+    @property
+    def base_url_is_explicit(self) -> bool:
+        """True when CT_BASE_URL was set rather than left at its default.
+
+        A server behind a proxy must use the configured public address, since
+        the request itself arrives as plain http. The desktop build has no such
+        proxy and may run on whichever port is free, so there the request's own
+        address is the accurate one.
+        """
+        return "base_url" in self.model_fields_set
 
     @property
     def db_path(self) -> Path:

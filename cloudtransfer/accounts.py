@@ -12,6 +12,7 @@ import logging
 
 from sqlalchemy import select
 
+from .appconfig import require_oauth_app
 from .config import Settings, get_settings
 from .crypto import decrypt, encrypt
 from .db import session_scope
@@ -125,7 +126,8 @@ class TokenManager:
                         f"reconnect the account."
                     )
                 log.debug("refreshing %s access token", self.provider)
-                tokens = await refresh_tokens(self.provider, self.settings, tokens.refresh_token)
+                app = await require_oauth_app(self.provider, self.settings)
+                tokens = await refresh_tokens(app, tokens.refresh_token)
                 await self._persist(tokens)
             self._cached = tokens
             return tokens.access_token

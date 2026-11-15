@@ -72,61 +72,42 @@ honoured instead of guessing, with exponential backoff and jitter otherwise.
 
 ---
 
-## Setup
+## Installing
 
-You need an OAuth client from each provider. Both are free.
+### Windows
 
-### Google
+Download `CloudTransfer-Setup-<version>.exe` from the
+[releases page](https://github.com/unilker/CloudTransfer/releases) and run it.
+It installs for the current user, so no administrator rights are needed, and
+adds a Start Menu entry. Launching it opens the interface in your browser and
+leaves an icon in the system tray to quit from.
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → create or pick a project.
-2. **APIs & Services → Library** → enable **Google Drive API**.
-3. **APIs & Services → OAuth consent screen** → External → add yourself as a
-   test user.
-4. **Credentials → Create credentials → OAuth client ID → Web application.**
-5. Authorized redirect URI: `http://localhost:8080/auth/google/callback`
-   (or your deployed address + `/auth/google/callback`).
-6. Copy the client ID and secret.
+Windows SmartScreen will warn that the publisher is unknown. The installer is
+not code-signed, which needs a paid certificate; choose **More info -> Run
+anyway**, or build it yourself (see [Building the installer](#building-the-installer)).
 
-Scope used: `drive.readonly`. This program never modifies your Drive.
+Settings, connected accounts and transfer history live in
+`%LOCALAPPDATA%\CloudTransfer`, next to a log file worth reading if anything
+misbehaves.
 
-### Microsoft
-
-1. [Azure Portal](https://portal.azure.com/) → **Microsoft Entra ID → App registrations → New registration**.
-2. Supported account types: personal *and* work/school, unless you only need one.
-3. Redirect URI, type **Web**: `http://localhost:8080/auth/microsoft/callback`.
-4. **API permissions → Microsoft Graph → Delegated**: `Files.ReadWrite`,
-   `offline_access`, `User.Read`.
-5. **Certificates & secrets → New client secret** → copy the *value*.
-
-Set `CT_MS_TENANT` to `common` for both account types, `consumers` for personal
-only, or your tenant GUID.
-
-### Configure
+### From source, on any platform
 
 ```bash
-cp .env.example .env
+python -m venv .venv && .venv/bin/pip install -e ".[desktop]"
 ```
-
-Fill in the four OAuth values. Everything else has a working default.
-
----
-
-## Running
-
-### Locally
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/cloudtransfer desktop
 ```
+
+That starts the local server, opens a browser and shows a tray icon. For a
+plain server with none of that:
 
 ```bash
 .venv/bin/cloudtransfer serve
 ```
 
-Then open <http://localhost:8080>, connect both accounts, pick a source folder
-and a destination folder, and start.
-
-### Running in a container
+### In a container
 
 This is the mode where your own machine carries no transfer traffic at all.
 
@@ -134,18 +115,82 @@ This is the mode where your own machine carries no transfer traffic at all.
 docker compose up -d
 ```
 
-Deploying somewhere reachable: set `CT_BASE_URL` to the `https://` address, put
-TLS in front of it, and register that same address as the redirect URI with
-both providers.
+Deploying somewhere reachable: set `CT_BASE_URL` to the `https://` address and
+put TLS in front of it.
 
-### Headless
+### Headless, one transfer at a time
 
 ```bash
 cloudtransfer transfer --source <drive-folder-id> --dest root --conflict rename
 ```
 
-Accounts have to be connected through the web UI once; the tokens are then
+Accounts have to be connected through the interface once; the tokens are then
 reused. Exit code is non-zero if any file failed.
+
+---
+
+## First run
+
+The application walks you through this, and nothing needs editing in a file.
+Both providers require an application of your own before any program may reach
+your files. There is no way around that: an unverified third-party app cannot
+be handed access to your Drive or OneDrive on your behalf.
+
+### Google
+
+1. [Google Cloud Console](https://console.cloud.google.com/) -> create a project.
+2. **APIs & Services -> Library** -> enable **Google Drive API**.
+3. **OAuth consent screen** -> External -> add yourself as a test user.
+4. **Credentials -> Create credentials -> OAuth client ID -> Desktop app.**
+5. Paste the client ID and secret into the setup step.
+
+Scope used: `drive.readonly`. This program never modifies your Drive.
+
+### Microsoft
+
+1. [Azure Portal](https://portal.azure.com/) -> **Microsoft Entra ID -> App
+   registrations -> New registration**.
+2. Account types: personal **and** work/school.
+3. Redirect URI -> platform **Mobile and desktop applications** -> paste the
+   address the setup page shows.
+4. **API permissions -> Microsoft Graph -> Delegated**: `Files.ReadWrite`,
+   `offline_access`, `User.Read`.
+5. Paste the **Application (client) ID** into the setup step. A desktop
+   registration needs no secret at all.
+
+The flow uses PKCE, which is what makes a client ID shipped inside an installer
+safe: an intercepted authorization code cannot be redeemed without the verifier
+this process generated and never sent.
+
+### Using environment variables instead
+
+A server deployment can skip the wizard by setting `CT_GOOGLE_CLIENT_ID` and
+friends (see `.env.example`). Values set that way appear in the interface as
+read-only, since they belong to the deployment rather than to one user.
+
+---
+
+## Building the installer
+
+PyInstaller cannot cross-compile, so a Windows installer has to be built on
+Windows. The repository does that in CI: push a tag and the workflow builds it,
+checks that the packaged executable really serves a page, and attaches the
+installer to a GitHub release.
+
+```bash
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+By hand, on a Windows machine:
+
+```
+python -m pip install -e ".[desktop,build]"
+pyinstaller packaging/cloudtransfer.spec --noconfirm
+iscc packaging/installer.iss
+```
+
+The spec also builds on macOS and Linux, producing an app bundle and a plain
+folder; only the Inno Setup step is Windows-specific.
 
 ---
 
@@ -211,6 +256,8 @@ a second, independently written implementation.
 | Area | File |
 |---|---|
 | Streaming, chunking, resume, verification | `tests/test_relay.py` |
+| PKCE, public clients, stored credentials | `tests/test_oauth.py` |
+| Port selection, console-less launch | `tests/test_desktop.py` |
 | Drive adapter over mocked HTTP | `tests/test_gdrive.py` |
 | OneDrive upload protocol | `tests/test_onedrive.py` |
 | Tree walking and name resolution | `tests/test_planner.py` |

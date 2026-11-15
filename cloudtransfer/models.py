@@ -101,6 +101,32 @@ class Account(Base):
         return time.time() >= (self.expires_at or 0) - 60
 
 
+class OAuthAppRow(Base):
+    """The registered Google/Microsoft application, set up inside the app.
+
+    Keeping these in the database rather than only in environment variables is
+    what lets the packaged desktop build configure itself: the first-run wizard
+    writes them here, so there is no file for the user to edit. Environment
+    variables still win nothing and lose nothing - they act as a fallback for
+    server deployments.
+    """
+
+    __tablename__ = "oauth_apps"
+    __table_args__ = (UniqueConstraint("provider", name="uq_oauth_apps_provider"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Empty for a public (desktop) client, which has no secret at all.
+    client_secret_enc: Mapped[str] = mapped_column(Text, default="")
+    tenant: Mapped[str] = mapped_column(String(64), default="common")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Job(Base):
     """One transfer request: a Drive folder (or file set) into a OneDrive folder."""
 

@@ -22,9 +22,118 @@
 <main>
   <div id="banner" class="banner" hidden></div>
 
-  <!-- 1. Accounts ------------------------------------------------------- -->
+  <!-- 1. One-time setup ------------------------------------------------- -->
+  <section class="card" id="setup-section">
+    <h2>
+      <span class="step">1</span> Set up access
+      <span class="pill pill-idle" id="setup-pill">checking&hellip;</span>
+      <button class="btn btn-small btn-quiet" id="setup-toggle" hidden>Show</button>
+    </h2>
+    <div id="setup-body">
+      <p class="lede">
+        Google and Microsoft both require an application of your own before any
+        program may reach your files. It is free, takes a few minutes, and is
+        only ever done once &mdash; paste the results below and nothing else needs
+        configuring.
+      </p>
+
+      <div class="setup-grid">
+        <div class="setup-card" id="setup-google" data-provider="google">
+          <div class="account-head">
+            <strong>Google Drive</strong>
+            <span class="pill pill-idle" data-role="state">not set up</span>
+          </div>
+
+          <ol class="steps">
+            <li>Open the <a href="https://console.cloud.google.com/" target="_blank"
+                rel="noopener">Google Cloud Console</a> and create a project.</li>
+            <li><em>APIs &amp; Services &rarr; Library</em> &rarr; enable <b>Google Drive API</b>.</li>
+            <li><em>OAuth consent screen</em> &rarr; External &rarr; add your own address
+                as a test user.</li>
+            <li><em>Credentials &rarr; Create credentials &rarr; OAuth client ID</em>
+                &rarr; <b>Desktop app</b>.</li>
+            <li>Copy the client ID and client secret into the boxes below.</li>
+          </ol>
+
+          <label class="field">
+            <span>Redirect URI <button class="btn btn-tiny" data-role="copy">Copy</button></span>
+            <input type="text" data-role="redirect" readonly>
+            <small class="field-hint">A Desktop app client accepts this automatically;
+              register it only if you chose Web application.</small>
+          </label>
+          <label class="field">
+            <span>Client ID</span>
+            <input type="text" data-role="client-id" autocomplete="off"
+                   placeholder="1234567890-abc.apps.googleusercontent.com">
+          </label>
+          <label class="field">
+            <span>Client secret</span>
+            <input type="password" data-role="client-secret" autocomplete="off"
+                   placeholder="GOCSPX-&hellip;">
+          </label>
+
+          <div class="field-actions">
+            <button class="btn btn-primary btn-small" data-role="save">Save</button>
+            <button class="btn btn-quiet btn-small" data-role="clear" hidden>Clear</button>
+            <span class="field-note" data-role="note"></span>
+          </div>
+        </div>
+
+        <div class="setup-card" id="setup-microsoft" data-provider="microsoft">
+          <div class="account-head">
+            <strong>OneDrive</strong>
+            <span class="pill pill-idle" data-role="state">not set up</span>
+          </div>
+
+          <ol class="steps">
+            <li>Open the <a href="https://portal.azure.com/" target="_blank"
+                rel="noopener">Azure Portal</a> &rarr; <em>Microsoft Entra ID &rarr;
+                App registrations &rarr; New registration</em>.</li>
+            <li>Account types: personal <b>and</b> work/school.</li>
+            <li>Redirect URI &rarr; platform <b>Mobile and desktop applications</b>
+                &rarr; paste the address below.</li>
+            <li><em>API permissions &rarr; Microsoft Graph &rarr; Delegated</em>:
+                <code>Files.ReadWrite</code>, <code>offline_access</code>,
+                <code>User.Read</code>.</li>
+            <li>Copy the <b>Application (client) ID</b> below. A desktop
+                registration needs no secret.</li>
+          </ol>
+
+          <label class="field">
+            <span>Redirect URI to register <button class="btn btn-tiny" data-role="copy">Copy</button></span>
+            <input type="text" data-role="redirect" readonly>
+          </label>
+          <label class="field">
+            <span>Application (client) ID</span>
+            <input type="text" data-role="client-id" autocomplete="off"
+                   placeholder="00000000-0000-0000-0000-000000000000">
+          </label>
+          <label class="field">
+            <span>Client secret <span class="optional">&mdash; leave empty for a desktop registration</span></span>
+            <input type="password" data-role="client-secret" autocomplete="off" placeholder="">
+          </label>
+          <label class="field">
+            <span>Account types</span>
+            <select data-role="tenant">
+              <option value="common">Personal and work/school</option>
+              <option value="consumers">Personal only</option>
+              <option value="organizations">Work/school only</option>
+            </select>
+          </label>
+
+          <div class="field-actions">
+            <button class="btn btn-primary btn-small" data-role="save">Save</button>
+            <button class="btn btn-quiet btn-small" data-role="clear" hidden>Clear</button>
+            <span class="field-note" data-role="note"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. Accounts ------------------------------------------------------- -->
   <section class="card">
-    <h2><span class="step">1</span> Connect both accounts</h2>
+    <h2><span class="step">2</span> Connect both accounts</h2>
     <div class="accounts">
       <div class="account" id="acct-google">
         <div class="account-head">
@@ -37,11 +146,6 @@
           <a class="btn btn-primary" data-role="connect" href="/auth/google/start">Connect</a>
           <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
         </div>
-        {% if not google_configured %}
-        <p class="account-warn">Not configured. Set <code>CT_GOOGLE_CLIENT_ID</code> and
-          <code>CT_GOOGLE_CLIENT_SECRET</code>, with redirect URI
-          <code>{{ google_redirect }}</code>.</p>
-        {% endif %}
       </div>
 
       <div class="account" id="acct-microsoft">
@@ -55,18 +159,13 @@
           <a class="btn btn-primary" data-role="connect" href="/auth/microsoft/start">Connect</a>
           <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
         </div>
-        {% if not ms_configured %}
-        <p class="account-warn">Not configured. Set <code>CT_MS_CLIENT_ID</code> and
-          <code>CT_MS_CLIENT_SECRET</code>, with redirect URI
-          <code>{{ ms_redirect }}</code>.</p>
-        {% endif %}
       </div>
     </div>
   </section>
 
-  <!-- 2. Pick folders --------------------------------------------------- -->
+  <!-- 3. Pick folders --------------------------------------------------- -->
   <section class="card" id="pick-section">
-    <h2><span class="step">2</span> Choose what moves where</h2>
+    <h2><span class="step">3</span> Choose what moves where</h2>
     <div class="pickers">
       <div class="picker" id="picker-source">
         <div class="picker-head">
@@ -117,9 +216,9 @@
     </div>
   </section>
 
-  <!-- 3. Jobs ----------------------------------------------------------- -->
+  <!-- 4. Jobs ----------------------------------------------------------- -->
   <section class="card">
-    <h2><span class="step">3</span> Transfers</h2>
+    <h2><span class="step">4</span> Transfers</h2>
     <div id="jobs" class="jobs"><p class="empty">No transfers yet.</p></div>
   </section>
 

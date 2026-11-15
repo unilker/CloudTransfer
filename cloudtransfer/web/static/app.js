@@ -235,11 +235,164 @@ const destPicker = new Picker('picker-dest', {
   side: 'onedrive',
 });
 
+// ---------------------------------------------------------------- setup
+
+// Whether each provider has a registered application. Until it does there is
+// nothing to connect to, so the connect buttons stay out of the way.
+let configured = { google: false, microsoft: false };
+let setupCollapsed = false;
+
+function setupCard(provider) {
+  return $('#setup-' + provider);
+}
+
+function renderSetupProvider(provider, entry) {
+  const card = setupCard(provider);
+  const state = $('[data-role="state"]', card);
+  const clear = $('[data-role="clear"]', card);
+  const redirect = $('[data-role="redirect"]', card);
+  const clientId = $('[data-role="client-id"]', card);
+  const tenant = $('[data-role="tenant"]', card);
+
+  if (redirect) redirect.value = entry.redirect_uri || '';
+  if (entry.client_id && document.activeElement !== clientId) {
+    clientId.value = entry.client_id;
+  }
+  if (tenant && entry.tenant) tenant.value = entry.tenant;
+
+  if (entry.configured) {
+    state.className = 'pill pill-on';
+    state.textContent = entry.source === 'env' ? 'set by environment' : 'ready';
+    clear.hidden = entry.source === 'env';
+  } else {
+    state.className = 'pill pill-idle';
+    state.textContent = 'not set up';
+    clear.hidden = true;
+  }
+
+  // Values that came from the environment belong to the deployment, not here.
+  const readOnly = entry.configured && entry.source === 'env';
+  $$('input:not([readonly]), select', card).forEach((el) => { el.disabled = readOnly; });
+  $('[data-role="save"]', card).disabled = readOnly;
+}
+
+function applySetupCollapse(complete) {
+  const body = $('#setup-body');
+  const toggle = $('#setup-toggle');
+  toggle.hidden = !complete;
+  // Once both sides are registered this step is done for good, so fold it away
+  // and let the page lead with the transfer rather than the paperwork.
+  const hide = complete && setupCollapsed;
+  body.hidden = hide;
+  toggle.textContent = hide ? 'Show' : 'Hide';
+}
+
+async function loadSetup() {
+  try {
+    const payload = await api('/api/setup');
+    for (const [provider, entry] of Object.entries(payload.providers)) {
+      configured[provider] = entry.configured;
+      renderSetupProvider(provider, entry);
+    }
+    const pill = $('#setup-pill');
+    if (payload.complete) {
+      pill.className = 'pill pill-on';
+      pill.textContent = 'done';
+    } else {
+      pill.className = 'pill pill-off';
+      pill.textContent = 'needed';
+      setupCollapsed = false;
+    }
+    applySetupCollapse(payload.complete);
+    return payload.complete;
+  } catch (error) {
+    banner.show('Could not read the setup state: ' + error.message, 'error', false);
+    return false;
+  }
+}
+
+function wireSetupCard(provider) {
+  const card = setupCard(provider);
+  const note = $('[data-role="note"]', card);
+
+  const copy = $('[data-role="copy"]', card);
+  if (copy) {
+    copy.addEventListener('click', async (event) => {
+      event.preventDefault();
+      const field = $('[data-role="redirect"]', card);
+      try {
+        await navigator.clipboard.writeText(field.value);
+        copy.textContent = 'Copied';
+        setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+      } catch {
+        // Clipboard access can be refused; selecting the text still works.
+        field.select();
+      }
+    });
+  }
+
+  $('[data-role="save"]', card).addEventListener('click', async () => {
+    const clientId = $('[data-role="client-id"]', card).value.trim();
+    const secretField = $('[data-role="client-secret"]', card);
+    const tenantField = $('[data-role="tenant"]', card);
+    if (!clientId) {
+      note.className = 'field-note bad';
+      note.textContent = 'A client ID is required.';
+      return;
+    }
+    note.className = 'field-note';
+    note.textContent = 'Saving…';
+    try {
+      const result = await api('/api/setup/' + provider, {
+        method: 'POST',
+        body: JSON.stringify({
+          client_id: clientId,
+          client_secret: secretField ? secretField.value.trim() : '',
+          tenant: tenantField ? tenantField.value : 'common',
+        }),
+      });
+      note.className = 'field-note ok';
+      note.textContent = result.public_client
+        ? 'Saved as a desktop registration (no secret needed).'
+        : 'Saved.';
+      if (secretField) secretField.value = '';
+      await loadSetup();
+      await loadStatus();
+    } catch (error) {
+      note.className = 'field-note bad';
+      note.textContent = error.message;
+    }
+  });
+
+  $('[data-role="clear"]', card).addEventListener('click', async () => {
+    if (!confirm('Clear the saved ' + provider + ' application settings?')) return;
+    try {
+      await api('/api/setup/' + provider, { method: 'DELETE' });
+      $('[data-role="client-id"]', card).value = '';
+      note.className = 'field-note';
+      note.textContent = '';
+      setupCollapsed = false;
+      await loadSetup();
+      await loadStatus();
+    } catch (error) {
+      note.className = 'field-note bad';
+      note.textContent = error.message;
+    }
+  });
+}
+
+['google', 'microsoft'].forEach(wireSetupCard);
+
+$('#setup-toggle').addEventListener('click', () => {
+  setupCollapsed = !setupCollapsed;
+  applySetupCollapse(true);
+});
+
 // ---------------------------------------------------------------- accounts
 
 let connected = { google: false, microsoft: false };
 
-function renderAccount(provider, info, configured) {
+function renderAccount(provider, info, isConfigured) {
   const card = $(`#acct-${provider}`);
   const state = $('[data-role="state"]', card);
   const who = $('[data-role="who"]', card);
@@ -253,10 +406,11 @@ function renderAccount(provider, info, configured) {
     connect.hidden = true;
     disconnect.hidden = false;
   } else {
-    state.className = configured ? 'pill pill-off' : 'pill pill-idle';
-    state.textContent = configured ? 'not connected' : 'not configured';
+    state.className = isConfigured ? 'pill pill-off' : 'pill pill-idle';
+    state.textContent = isConfigured ? 'not connected' : 'finish step 1 first';
     who.textContent = '';
-    connect.hidden = !configured;
+    // Offering "Connect" before an application exists only leads to an error.
+    connect.hidden = !isConfigured;
     disconnect.hidden = true;
   }
 }
@@ -265,6 +419,7 @@ async function loadStatus() {
   try {
     const status = await api('/api/status');
     connected = { google: !!status.google, microsoft: !!status.microsoft };
+    configured = status.configured;
     renderAccount('google', status.google, status.configured.google);
     renderAccount('microsoft', status.microsoft, status.configured.microsoft);
     if (connected.google) sourcePicker.enable();
@@ -295,6 +450,7 @@ function refreshStartButton() {
   const button = $('#start');
   const hint = $('#start-hint');
   const reasons = [];
+  if (!configured.google || !configured.microsoft) reasons.push('finish the setup step');
   if (!connected.google) reasons.push('connect Google Drive');
   if (!connected.microsoft) reasons.push('connect OneDrive');
   if (!sourcePicker.selected) reasons.push('pick a source folder');
@@ -540,6 +696,11 @@ async function refreshJobs() {
     banner.show(params.get('error'), 'error', false);
     history.replaceState({}, '', location.pathname);
   }
-  loadStatus();
+  (async () => {
+    const complete = await loadSetup();
+    // A returning user has already done the paperwork; lead with the transfer.
+    if (complete) { setupCollapsed = true; applySetupCollapse(true); }
+    await loadStatus();
+  })();
   refreshJobs();
 })();

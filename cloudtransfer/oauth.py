@@ -1,7 +1,7 @@
-"""OAuth 2.0 authorization-code flow for Google and Microsoft.
+"""OAuth 2.0 authorization-code flow, for both a hosted app and a desktop one.
 
 Both providers use the same shape, so one implementation covers them with a
-small per-provider descriptor. Two details matter in practice:
+small per-provider descriptor. The details that matter in practice:
 
 * Google only issues a refresh token when asked with ``access_type=offline``,
   and only re-issues one on ``prompt=consent``. Without it the app works until
@@ -9,10 +9,17 @@ small per-provider descriptor. Two details matter in practice:
 * Microsoft requires ``offline_access`` in the scope list for the same reason,
   and rotates the refresh token on every exchange, so the new one must be
   stored each time.
+* **PKCE is always used.** A desktop build is a public client: its client ID
+  ships inside the installer, and Microsoft's "Mobile and desktop" app type
+  issues no secret at all. PKCE is what stops an intercepted authorization
+  code from being redeemed by anyone else, and both providers accept it on
+  confidential clients too, so there is no reason to branch.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -20,7 +27,6 @@ from typing import Any
 
 import httpx
 
-from .config import Settings
 from .errors import AuthError
 from .http import build_client, request_with_retry
 
@@ -37,6 +43,29 @@ MS_SCOPES = [
     "https://graph.microsoft.com/Files.ReadWrite",
     "https://graph.microsoft.com/User.Read",
 ]
+
+PROVIDERS = ("google", "microsoft")
+
+HUMAN_NAMES = {"google": "Google Drive", "microsoft": "OneDrive"}
+
+
+@dataclass(slots=True)
+class OAuthApp:
+    """The registered application a user connects their account through.
+
+    ``client_secret`` is empty for a public (desktop) client. Where it is set,
+    it is sent on the token exchange as a confidential client would.
+    """
+
+    provider: str
+    client_id: str
+    client_secret: str = ""
+    tenant: str = "common"
+    source: str = "stored"  # "stored" (set up in the app) or "env"
+
+    @property
+    def is_public_client(self) -> bool:
+        return not self.client_secret
 
 
 @dataclass(slots=True)
@@ -63,6 +92,7 @@ def google_config() -> ProviderConfig:
 
 
 def microsoft_config(tenant: str) -> ProviderConfig:
+    tenant = tenant or "common"
     return ProviderConfig(
         name="microsoft",
         authorize_url=f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize",
@@ -72,24 +102,33 @@ def microsoft_config(tenant: str) -> ProviderConfig:
     )
 
 
-def config_for(provider: str, settings: Settings) -> ProviderConfig:
-    if provider == "google":
+def config_for(app: OAuthApp) -> ProviderConfig:
+    if app.provider == "google":
         return google_config()
-    if provider == "microsoft":
-        return microsoft_config(settings.ms_tenant)
-    raise AuthError(f"Unknown provider {provider!r}")
+    if app.provider == "microsoft":
+        return microsoft_config(app.tenant)
+    raise AuthError(f"Unknown provider {app.provider!r}")
 
 
-def credentials_for(provider: str, settings: Settings) -> tuple[str, str, str]:
-    """Return (client_id, client_secret, redirect_uri) for a provider."""
-    settings.require_provider(provider)
-    if provider == "google":
-        return (
-            settings.google_client_id,
-            settings.google_client_secret,
-            settings.google_redirect_uri,
-        )
-    return settings.ms_client_id, settings.ms_client_secret, settings.ms_redirect_uri
+# --------------------------------------------------------------------- PKCE
+
+
+def new_state() -> str:
+    """CSRF state for the authorization redirect."""
+    return secrets.token_urlsafe(24)
+
+
+def new_pkce_verifier() -> str:
+    """A high-entropy code verifier, within RFC 7636's 43-128 character range."""
+    return secrets.token_urlsafe(64)[:128]
+
+
+def pkce_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+# ------------------------------------------------------------------- tokens
 
 
 @dataclass(slots=True)
@@ -118,59 +157,61 @@ class TokenSet:
         )
 
 
-def new_state() -> str:
-    """CSRF state for the authorization redirect."""
-    return secrets.token_urlsafe(24)
-
-
-def authorize_url(provider: str, settings: Settings, state: str) -> str:
-    cfg = config_for(provider, settings)
-    client_id, _, redirect_uri = credentials_for(provider, settings)
+def authorize_url(app: OAuthApp, redirect_uri: str, state: str, code_verifier: str) -> str:
+    cfg = config_for(app)
     params = {
-        "client_id": client_id,
+        "client_id": app.client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": " ".join(cfg.scopes),
         "state": state,
+        "code_challenge": pkce_challenge(code_verifier),
+        "code_challenge_method": "S256",
         **cfg.extra_authorize_params,
     }
     return str(httpx.URL(cfg.authorize_url, params=params))
 
 
-async def exchange_code(provider: str, settings: Settings, code: str) -> TokenSet:
-    cfg = config_for(provider, settings)
-    client_id, client_secret, redirect_uri = credentials_for(provider, settings)
+def _token_request_data(app: OAuthApp) -> dict[str, str]:
+    data = {"client_id": app.client_id}
+    if app.client_secret:
+        data["client_secret"] = app.client_secret
+    return data
+
+
+async def exchange_code(
+    app: OAuthApp, redirect_uri: str, code: str, code_verifier: str
+) -> TokenSet:
+    cfg = config_for(app)
     data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
+        **_token_request_data(app),
         "code": code,
         "grant_type": "authorization_code",
         "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
     }
     async with build_client() as client:
         response = await request_with_retry(
             client, "POST", cfg.token_url, data=data, max_retries=3
         )
-    payload = response.json()
-    tokens = TokenSet.from_response(payload)
+    tokens = TokenSet.from_response(response.json())
     if not tokens.refresh_token:
         raise AuthError(
-            f"{provider} returned no refresh token. Revoke this app's access in the "
-            f"provider's account settings and connect again so consent is re-prompted."
+            f"{HUMAN_NAMES.get(app.provider, app.provider)} returned no refresh token. "
+            f"Remove this app's access in your account settings and connect again, so "
+            f"the consent screen is shown afresh."
         )
     return tokens
 
 
-async def refresh_tokens(provider: str, settings: Settings, refresh_token: str) -> TokenSet:
-    cfg = config_for(provider, settings)
-    client_id, client_secret, _ = credentials_for(provider, settings)
+async def refresh_tokens(app: OAuthApp, refresh_token: str) -> TokenSet:
+    cfg = config_for(app)
     data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
+        **_token_request_data(app),
         "refresh_token": refresh_token,
         "grant_type": "refresh_token",
     }
-    if provider == "microsoft":
+    if app.provider == "microsoft":
         data["scope"] = " ".join(cfg.scopes)
     async with build_client() as client:
         try:
@@ -179,7 +220,8 @@ async def refresh_tokens(provider: str, settings: Settings, refresh_token: str) 
             )
         except Exception as exc:
             raise AuthError(
-                f"Could not refresh the {provider} token; reconnect the account. ({exc})"
+                f"Could not refresh the {HUMAN_NAMES.get(app.provider, app.provider)} "
+                f"token; reconnect the account. ({exc})"
             ) from exc
     return TokenSet.from_response(response.json(), previous_refresh=refresh_token)
 

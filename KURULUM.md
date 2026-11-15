@@ -6,68 +6,41 @@ doğrudan OneDrive'a yazılır. Geçici klasör yoktur, yarım dosya kalmaz.
 
 > **Önemli:** İki bulutu birbiriyle doğrudan konuşturmak mümkün değil. Google
 > Drive'ın "şu adrese gönder" diye bir API'si yok; Microsoft'un "URL'den yükle"
-> özelliği ise geri çekildi. Bu yüzden baytların bir aracıdan geçmesi
-> gerekiyor. Bu yazılım o aracı. **Bilgisayarınıza hiç bayt gelmemesi için
-> uygulamayı bir sunucuda veya konteynerde çalıştırın** — o zaman bilgisayarınız
-> yalnızca arayüzü açar.
+> özelliği ise geri çekildi. Bu yüzden baytların bir aracıdan geçmesi gerekiyor.
+> Bu yazılım o aracı. Bilgisayarınıza hiç bayt gelmemesini istiyorsanız
+> uygulamayı bir sunucuda veya konteynerde çalıştırın; Windows kurulumunda
+> aktarım sizin bağlantınızı kullanır.
 
 ---
 
-## 1. Google tarafı
+## 1. Programı kurun
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → proje oluşturun.
-2. **APIs & Services → Library** → **Google Drive API**'yi etkinleştirin.
-3. **OAuth consent screen** → External → kendinizi test kullanıcısı ekleyin.
-4. **Credentials → Create credentials → OAuth client ID → Web application.**
-5. Yetkili yönlendirme adresi:
-   `http://localhost:8080/auth/google/callback`
-6. Client ID ve Client Secret değerlerini kopyalayın.
+### Windows
 
-Kullanılan izin `drive.readonly`'dir — uygulama Drive'ınızda hiçbir değişiklik
-yapmaz.
+[Sürümler sayfasından](https://github.com/unilker/CloudTransfer/releases)
+`CloudTransfer-Setup-<sürüm>.exe` dosyasını indirip çalıştırın. Yalnızca sizin
+kullanıcınıza kurulur; yönetici yetkisi gerekmez.
 
-## 2. Microsoft tarafı
+Windows SmartScreen "yayıncı bilinmiyor" uyarısı verecek. Kurulum dosyası
+imzalı değil (imza ücretli bir sertifika gerektiriyor). **Ek bilgi → Yine de
+çalıştır** deyin, ya da kaynaktan kendiniz derleyin.
 
-1. [Azure Portal](https://portal.azure.com/) → **Microsoft Entra ID →
-   App registrations → New registration**.
-2. Hesap türü: kişisel **ve** iş/okul hesapları.
-3. Redirect URI (tür: **Web**):
-   `http://localhost:8080/auth/microsoft/callback`
-4. **API permissions → Microsoft Graph → Delegated**: `Files.ReadWrite`,
-   `offline_access`, `User.Read`.
-5. **Certificates & secrets → New client secret** → **Value** sütunundaki
-   değeri kopyalayın (Secret ID'yi değil).
+Program açıldığında arayüz tarayıcınızda açılır ve sistem tepsisinde bir simge
+bırakır. Çıkmak için o simgeye sağ tıklayıp **Quit** deyin.
 
-## 3. Ayarlar
+Ayarlarınız, bağlı hesaplarınız ve aktarım geçmişiniz
+`%LOCALAPPDATA%\CloudTransfer` klasöründe tutulur; bir sorun olursa aynı yerdeki
+günlük dosyasına bakın.
+
+### Kaynaktan (her platform)
 
 ```bash
-cp .env.example .env
-```
-
-`.env` içinde şu dört değeri doldurun:
-
-```
-CT_GOOGLE_CLIENT_ID=
-CT_GOOGLE_CLIENT_SECRET=
-CT_MS_CLIENT_ID=
-CT_MS_CLIENT_SECRET=
-```
-
-Geri kalanların varsayılanı çalışır durumdadır.
-
-## 4. Çalıştırma
-
-### Kendi bilgisayarınızda
-
-```bash
-python -m venv .venv && .venv/bin/pip install -e .
+python -m venv .venv && .venv/bin/pip install -e ".[desktop]"
 ```
 
 ```bash
-.venv/bin/cloudtransfer serve
+.venv/bin/cloudtransfer desktop
 ```
-
-Ardından <http://localhost:8080> adresini açın.
 
 ### Konteynerde (bilgisayarınıza hiç trafik gelmez)
 
@@ -75,18 +48,61 @@ Ardından <http://localhost:8080> adresini açın.
 docker compose up -d
 ```
 
-Uzak bir sunucuya kurarsanız `CT_BASE_URL` değerini `https://` adresiniz yapın
-ve aynı adresi iki sağlayıcıda da yönlendirme adresi olarak kaydedin.
+---
 
-## 5. Kullanım
+## 2. İlk açılışta erişim ayarı
 
-1. İki hesabı da bağlayın.
-2. Soldan Drive klasörünü, sağdan OneDrive klasörünü seçin.
-3. Aynı isim varsa ne olacağını seçin, "Start transfer" deyin.
+Program sizi adım adım yönlendirir; **hiçbir dosyayı elle düzenlemeniz
+gerekmez**. Ancak Google ve Microsoft, dosyalarınıza erişecek her program için
+sizin adınıza kayıtlı bir uygulama ister. Bunun etrafından dolaşmak mümkün
+değil: doğrulanmamış üçüncü taraf bir uygulamaya hesabınız adına erişim
+verilemiyor.
+
+### Google tarafı
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → proje oluşturun.
+2. **APIs & Services → Library** → **Google Drive API**'yi etkinleştirin.
+3. **OAuth consent screen** → External → kendinizi test kullanıcısı ekleyin.
+4. **Credentials → Create credentials → OAuth client ID → Desktop app.**
+5. Çıkan **Client ID** ve **Client secret** değerlerini programdaki 1. adıma
+   yapıştırıp **Save** deyin.
+
+Kullanılan izin `drive.readonly`'dir — program Drive'ınızda hiçbir değişiklik
+yapmaz.
+
+### Microsoft tarafı
+
+1. [Azure Portal](https://portal.azure.com/) → **Microsoft Entra ID →
+   App registrations → New registration**.
+2. Hesap türü: kişisel **ve** iş/okul hesapları.
+3. Redirect URI → platform olarak **Mobile and desktop applications** seçin ve
+   programdaki 1. adımda gösterilen adresi yapıştırın (yanındaki **Copy**
+   düğmesi işinizi görür).
+4. **API permissions → Microsoft Graph → Delegated**: `Files.ReadWrite`,
+   `offline_access`, `User.Read`.
+5. **Application (client) ID** değerini programa yapıştırın. Masaüstü kaydı için
+   **client secret gerekmez**; o kutuyu boş bırakın.
+
+> Microsoft tarafında secret oluşturursanız, **Value** sütunundaki değeri
+> kopyalamanız gerekir, Secret ID'yi değil. İnsanların en çok takıldığı yer
+> burası — ama masaüstü kaydında zaten gerek yok.
+
+İki kutu da yeşil "ready" olduğunda 1. adım kendiliğinden kapanır ve bir daha
+karşınıza çıkmaz.
+
+---
+
+## 3. Kullanım
+
+1. 2. adımda iki hesabı da **Connect** ile bağlayın.
+2. 3. adımda soldan Drive klasörünü, sağdan OneDrive klasörünü seçin.
+3. Aynı isim varsa ne olacağını seçip **Start transfer** deyin.
 
 Aktarım sırasında duraklatabilirsiniz; kaldığı **baytdan** devam eder. Bittiğinde
-"Download report" ile her dosyanın durumunu, yeniden adlandırmaları ve atlanan
+**Download report** ile her dosyanın durumunu, yeniden adlandırmaları ve atlanan
 dosyaların gerekçelerini CSV olarak indirebilirsiniz.
+
+---
 
 ## Bilmeniz gerekenler
 
@@ -99,3 +115,5 @@ dosyaların gerekçelerini CSV olarak indirebilirsiniz.
   yazılır.
 - **Drive'dan hiçbir şey silinmez.** Erişim salt okunurdur; bu bir kopyalamadır.
 - Her dosya aktarımdan sonra karma (hash) ile doğrulanır.
+- Program 8765 numaralı portu kullanır. Meşgulse bir üstünü dener; o durumda
+  1. adımdaki yönlendirme adresi de değişir ve ekranda güncel hâli görünür.
