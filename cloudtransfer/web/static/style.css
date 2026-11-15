@@ -330,7 +330,15 @@ main { max-width: 1120px; margin: 0 auto; padding: 0 16px 56px; }
   gap: 12px;
   flex-wrap: wrap;
 }
-.job-route { font-size: 14px; font-weight: 600; }
+.job-route {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+.job-path { display: inline-flex; align-items: center; flex-wrap: wrap; }
 .job-route .arrow { color: var(--text-faint); font-weight: 400; margin: 0 6px; }
 .job-status {
   font-size: 11.5px;

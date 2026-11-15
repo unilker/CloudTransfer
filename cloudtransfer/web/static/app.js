@@ -694,6 +694,12 @@ $('#start').addEventListener('click', async () => {
 const expanded = new Set();
 const taskCache = new Map();
 
+function taskStatusLabel(status) {
+  const key = `task.${status}`;
+  const translated = t(key);
+  return translated === key ? status : translated;
+}
+
 function statusLabel(status) {
   // Falls back to the raw value, so a status added server-side still shows
   // something sensible before it gets a translation.
@@ -756,8 +762,10 @@ function jobCard(job) {
          data-running="${job.running ? 'true' : 'false'}">
       <div class="job-top">
         <div class="job-route">
-          #${job.id} ${escapeHtml(job.source_folder_name || job.source_folder_id)}
-          <span class="arrow">→</span>${escapeHtml(job.dest_folder_path || '')}
+          <span class="job-path">
+            #${job.id} ${escapeHtml(job.source_folder_name || job.source_folder_id)}
+            <span class="arrow">→</span>${escapeHtml(job.dest_folder_path || '')}
+          </span>
           <span class="job-direction">${escapeHtml(
             job.direction ? t(`direction.${job.direction}`) : ''
           )}</span>
@@ -786,7 +794,7 @@ function renderTasks(container, payload) {
     else if (task.hash_note && task.verified === false) notes.push(task.hash_note);
 
     return `<tr>
-      <td class="st t-${task.status}">${escapeHtml(task.status)}</td>
+      <td class="st t-${task.status}">${escapeHtml(taskStatusLabel(task.status))}</td>
       <td>${escapeHtml(task.dest_path)}${
         notes.length ? `<div class="why">${escapeHtml(notes.join(' · '))}</div>` : ''}</td>
       <td class="st">${task.size_is_estimate && !task.bytes_done ? '~' : ''}${bytes(task.source_size)}</td>
