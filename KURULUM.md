@@ -116,6 +116,37 @@ dosyaların gerekçelerini CSV olarak indirebilirsiniz.
 
 ---
 
+## Kurulum "dosyalar kullanımda" diyorsa
+
+CloudTransfer bildirim alanından (saatin yanından) çalışır. Açıkken Windows
+dosyalarını kilitli tutar; bu yüzden ne kurulum ne de kaldırma onları
+değiştirebilir.
+
+Kurulum bunu fark edip sizden programı kapatmanızı ister. Yine de karşılaşırsanız:
+
+1. Görev çubuğunun **sağ alt** köşesindeki bildirim alanında CloudTransfer
+   simgesine sağ tıklayıp **Quit** deyin. Simge görünmüyorsa oradaki küçük
+   **ok** işaretine tıklayıp gizli simgeleri açın.
+2. Simge yoksa **Görev Yöneticisi** → **Ayrıntılar** sekmesi →
+   **CloudTransfer.exe** → **Görevi sonlandır**.
+3. Kurulumu yeniden çalıştırın.
+
+Kaldırma işlemi bu yüzden yarıda kaldıysa ve klasör geride kaldıysa, yeniden
+kurmadan önce şu klasörü silin:
+
+```
+%LOCALAPPDATA%\Programs\CloudTransfer
+```
+
+Ayarlarınız, bağlı hesaplarınız ve aktarım geçmişiniz **başka** bir yerde
+tutulur ve bundan etkilenmez:
+
+```
+%LOCALAPPDATA%\CloudTransfer
+```
+
+---
+
 ## Bilmeniz gerekenler
 
 - **Google Docs/Sheets/Slides** dosyaları Drive'dan çıkarken `.docx`/`.xlsx`/

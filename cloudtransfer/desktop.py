@@ -37,6 +37,14 @@ PORT_SCAN_LIMIT = 20
 
 HOST = "127.0.0.1"
 
+# A named mutex held for as long as the application runs. The Windows
+# installer looks for exactly this name (AppMutex in installer.iss) so it can
+# say "close the application first" instead of failing partway through with a
+# file it could not replace. Changing it here means changing it there too.
+APP_MUTEX_NAME = "CloudTransferSingleInstance"
+
+_ERROR_ALREADY_EXISTS = 183
+
 
 def port_is_free(port: int, host: str = HOST) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -118,6 +126,73 @@ def wait_until_serving(port: int, timeout: float = 30.0, host: str = HOST) -> bo
             return True
         time.sleep(0.15)
     return False
+
+
+class SingleInstanceLock:
+    """Holds a named Windows mutex for the lifetime of the process.
+
+    Two jobs in one object: a second launch can tell that the application is
+    already running, and the installer can tell the same thing, which is what
+    lets it ask the user to close it rather than tripping over locked files.
+
+    On anything other than Windows this does nothing and reports nothing,
+    since there is no installer there to care.
+    """
+
+    def __init__(self, name: str = APP_MUTEX_NAME) -> None:
+        self.name = name
+        self.handle = None
+        self.already_running = False
+
+    def acquire(self) -> bool:
+        """Take the lock. Returns False if another instance already holds it."""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_bool,
+                ctypes.c_wchar_p,
+            ]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            # Session-local, not "Global\\": creating a global object needs a
+            # privilege a normal user account does not have, and the installer
+            # runs in the same session anyway.
+            handle = kernel32.CreateMutexW(None, False, self.name)
+            last_error = ctypes.get_last_error()
+            if not handle:
+                log.debug("could not create the single-instance mutex (%d)", last_error)
+                return True
+            self.handle = handle
+            self.already_running = last_error == _ERROR_ALREADY_EXISTS
+            return not self.already_running
+        except Exception as exc:  # pragma: no cover - never fatal
+            log.debug("single-instance lock unavailable: %s", exc)
+            return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle(self.handle)
+        except Exception:  # pragma: no cover - process is ending anyway
+            pass
+        finally:
+            self.handle = None
+
+    def __enter__(self) -> SingleInstanceLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
 
 
 class ServerThread(threading.Thread):
@@ -231,13 +306,18 @@ def run_desktop(
 
     preferred = port or int(os.environ.get("CT_PORT") or DEFAULT_PORT)
 
+    # Held until the process exits, so the installer can see we are running.
+    lock = SingleInstanceLock()
+    lock.acquire()
+
     # A second launch should bring the first one forward, not fail to bind.
-    if already_running(preferred):
+    if lock.already_running or already_running(preferred):
         url = f"http://{HOST}:{preferred}"
         log.info("CloudTransfer is already running at %s", url)
         if open_browser:
             webbrowser.open(url)
         print(f"CloudTransfer is already running at {url}")
+        lock.release()
         return 0
 
     chosen = find_port(preferred)
@@ -251,6 +331,7 @@ def run_desktop(
 
     if not wait_until_serving(chosen):
         server.stop()
+        lock.release()
         message = (
             f"CloudTransfer could not start on {url}.\n"
             f"See the log at {log_path} for details."
@@ -263,10 +344,14 @@ def run_desktop(
     if open_browser:
         webbrowser.open(url)
 
-    if tray:
-        try:
-            return _run_tray(url, server)
-        except Exception as exc:  # noqa: BLE001 - headless or no tray available
-            log.info("no system tray available (%s); staying in the console", exc)
-
-    return _run_console(url, server)
+    try:
+        if tray:
+            try:
+                return _run_tray(url, server)
+            except Exception as exc:  # noqa: BLE001 - headless or no tray
+                log.info("no system tray available (%s); staying in the console", exc)
+        return _run_console(url, server)
+    finally:
+        # Release it promptly, so an installer started right after the window
+        # closes does not still see the application as running.
+        lock.release()

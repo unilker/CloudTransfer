@@ -41,6 +41,20 @@ AppPublisher={#AppPublisher}
 VersionInfoVersion={#NumericVersion}
 VersionInfoTextVersion={#AppVersion}
 
+; CloudTransfer runs from the notification area, so its files stay locked while
+; it is open and an install or uninstall cannot replace them. The application
+; holds this named mutex for as long as it runs (APP_MUTEX_NAME in
+; cloudtransfer/desktop.py - the two names must match), which lets Setup say so
+; plainly instead of failing partway through on a file it could not write.
+AppMutex=CloudTransferSingleInstance
+; Belt and braces: also ask Restart Manager to close anything still holding a
+; file, for an instance started in a way the mutex check missed.
+CloseApplications=yes
+CloseApplicationsFilter=*.exe,*.dll,*.pyd
+RestartApplications=no
+; Two installers running at once would fight over the same files.
+SetupMutex=CloudTransferSetup
+
 ; Per-user install: no UAC prompt, no administrator account needed.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
@@ -73,6 +87,15 @@ AppComments=Transfers files from Google Drive to OneDrive without saving them to
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "turkish";  MessagesFile: "compiler:Languages\Turkish.isl"
+
+[Messages]
+; The stock wording just says "close all instances", which is no help when the
+; application has no window - it lives in the notification area. Say where it
+; actually is, and what to do if it cannot be found there.
+english.SetupAppRunningError=CloudTransfer is still running, so Setup cannot replace its files.%n%nRight-click the CloudTransfer icon in the notification area (bottom-right of the taskbar - you may need to click the small arrow to show hidden icons) and choose Quit.%n%nIf you cannot find it there, open Task Manager, find CloudTransfer.exe on the Details tab and end it.%n%nThen click OK to continue, or Cancel to exit.
+english.UninstallAppRunningError=CloudTransfer is still running, so it cannot be removed.%n%nRight-click the CloudTransfer icon in the notification area (bottom-right of the taskbar - you may need to click the small arrow to show hidden icons) and choose Quit.%n%nIf you cannot find it there, open Task Manager, find CloudTransfer.exe on the Details tab and end it.%n%nThen click OK to continue, or Cancel to exit.
+turkish.SetupAppRunningError=CloudTransfer hala calisiyor, bu yuzden dosyalari degistirilemiyor.%n%nGorev cubugunun sag alt kosesindeki bildirim alaninda CloudTransfer simgesine sag tiklayip Quit deyin (simge gizliyse kucuk ok isaretine tiklayin).%n%nSimgeyi bulamazsaniz Gorev Yoneticisi'ni acip Ayrintilar sekmesinde CloudTransfer.exe surecini sonlandirin.%n%nArdindan devam etmek icin Tamam'a basin.
+turkish.UninstallAppRunningError=CloudTransfer hala calisiyor, bu yuzden kaldirilamiyor.%n%nGorev cubugunun sag alt kosesindeki bildirim alaninda CloudTransfer simgesine sag tiklayip Quit deyin (simge gizliyse kucuk ok isaretine tiklayin).%n%nSimgeyi bulamazsaniz Gorev Yoneticisi'ni acip Ayrintilar sekmesinde CloudTransfer.exe surecini sonlandirin.%n%nArdindan devam etmek icin Tamam'a basin.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \

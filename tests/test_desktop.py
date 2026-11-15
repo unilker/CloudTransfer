@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import pathlib
 import socket
 import sys
 
@@ -11,9 +12,11 @@ import pytest
 
 from cloudtransfer.config import platform_data_dir
 from cloudtransfer.desktop import (
+    APP_MUTEX_NAME,
     DEFAULT_PORT,
     HOST,
     PORT_SCAN_LIMIT,
+    SingleInstanceLock,
     _NullStream,
     already_running,
     configure_file_logging,
@@ -174,3 +177,81 @@ def test_a_frozen_build_does_not_use_the_working_directory(monkeypatch):
     finally:
         monkeypatch.delattr(sys, "frozen", raising=False)
         importlib.reload(config_module)
+
+
+# ------------------------------------------------------ single-instance lock
+
+
+def test_the_lock_can_be_taken_and_released():
+    lock = SingleInstanceLock()
+    assert lock.acquire() is True
+    assert lock.already_running is False
+    lock.release()
+    assert lock.handle is None
+
+
+def test_releasing_twice_is_harmless():
+    lock = SingleInstanceLock()
+    lock.acquire()
+    lock.release()
+    lock.release()  # must not raise
+
+
+def test_the_lock_works_as_a_context_manager():
+    with SingleInstanceLock() as lock:
+        assert lock.name == APP_MUTEX_NAME
+    assert lock.handle is None
+
+
+def test_the_lock_never_blocks_startup_when_it_cannot_be_created(monkeypatch):
+    """A failure here must not stop the application running."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    def explode(*_args, **_kwargs):
+        raise OSError("no kernel32 here")
+
+    monkeypatch.setattr("ctypes.WinDLL", explode, raising=False)
+    lock = SingleInstanceLock()
+    assert lock.acquire() is True
+    assert lock.already_running is False
+
+
+def test_the_installer_waits_for_the_same_mutex_the_app_holds():
+    """Two files, one name. If they drift, the installer silently stops
+    detecting the running application and goes back to failing on locked
+    files - which is the bug this pair exists to prevent."""
+    iss = (
+        pathlib.Path(__file__).resolve().parents[1] / "packaging" / "installer.iss"
+    ).read_text(encoding="utf-8")
+
+    declared = [
+        line.split("=", 1)[1].strip()
+        for line in iss.splitlines()
+        if line.strip().startswith("AppMutex=")
+    ]
+    assert declared == [APP_MUTEX_NAME], (
+        f"installer.iss declares {declared}, the application holds {APP_MUTEX_NAME!r}"
+    )
+
+
+def test_the_installer_also_asks_restart_manager_to_close_holders():
+    iss = (
+        pathlib.Path(__file__).resolve().parents[1] / "packaging" / "installer.iss"
+    ).read_text(encoding="utf-8")
+    assert "CloseApplications=yes" in iss
+    # Two installers at once would fight over the same files.
+    assert "SetupMutex=" in iss
+
+
+def test_the_running_app_message_says_where_to_look():
+    """The application has no window, so "close all instances" is not enough."""
+    iss = (
+        pathlib.Path(__file__).resolve().parents[1] / "packaging" / "installer.iss"
+    ).read_text(encoding="utf-8")
+    message = next(
+        line for line in iss.splitlines()
+        if line.startswith("english.SetupAppRunningError=")
+    )
+    assert "notification area" in message
+    assert "Task Manager" in message
+    assert "CloudTransfer.exe" in message

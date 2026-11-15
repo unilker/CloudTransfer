@@ -217,6 +217,39 @@ folder; only the Inno Setup step is Windows-specific.
 
 ---
 
+## When the installer says files are in use
+
+CloudTransfer runs from the notification area, so while it is open Windows
+keeps its files locked and neither an install nor an uninstall can replace
+them.
+
+The installer detects this and asks you to close the application first. If you
+meet it anyway:
+
+1. Right-click the CloudTransfer icon in the notification area, bottom-right of
+   the taskbar — click the small arrow first if hidden icons are collapsed —
+   and choose **Quit**.
+2. No icon there? Open Task Manager, find **CloudTransfer.exe** on the Details
+   tab, and end it.
+3. Run the installer again.
+
+If an uninstall was interrupted by this and left files behind, delete the
+leftover folder before installing again. It is wherever the previous version
+was installed, usually:
+
+```
+%LOCALAPPDATA%\Programs\CloudTransfer
+```
+
+Your settings, connected accounts and transfer history are kept somewhere else
+and are not affected:
+
+```
+%LOCALAPPDATA%\CloudTransfer
+```
+
+---
+
 ## Configuration
 
 | Variable | Default | Notes |
