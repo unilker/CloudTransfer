@@ -217,6 +217,33 @@ folder; only the Inno Setup step is Windows-specific.
 
 ---
 
+## When the browser says the site cannot be reached
+
+The application opened a browser but the page does not load: the server either
+never started, or it is on a different port.
+
+1. **Read the log.** Paste this into Explorer's address bar:
+
+   ```
+   %LOCALAPPDATA%\CloudTransfer
+   ```
+
+   The last lines of `cloudtransfer.log` either say
+   `CloudTransfer is serving at http://127.0.0.1:...` — open that address — or
+   give the reason it could not start.
+
+2. **`runtime.json`** in the same folder records the address the running
+   instance actually answers on.
+
+3. Still nothing: quit from the tray icon, or end every `CloudTransfer.exe` in
+   Task Manager, and start it again.
+
+The default port is 8765. If something else already has it, the application
+moves to the next free one and records where it went, so a second launch finds
+it rather than guessing.
+
+---
+
 ## When the installer says files are in use
 
 CloudTransfer runs from the notification area, so while it is open Windows

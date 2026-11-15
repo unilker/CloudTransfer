@@ -147,6 +147,29 @@ tutulur ve bundan etkilenmez:
 
 ---
 
+## Tarayıcı "Bu siteye ulaşılamıyor" diyorsa
+
+Program açılıp tarayıcıyı açtı ama sayfa gelmiyorsa, sunucu ya hiç başlamadı ya
+da başka bir portta çalışıyor demektir.
+
+1. **Günlük dosyasına bakın.** Dosya Gezgini'nin adres çubuğuna şunu yapıştırın:
+
+   ```
+   %LOCALAPPDATA%\CloudTransfer
+   ```
+
+   Oradaki `cloudtransfer.log` dosyasının son satırları ya
+   `CloudTransfer is serving at http://127.0.0.1:...` der (o adresi tarayıcıya
+   yazın) ya da başlayamama sebebini yazar.
+
+2. **Aynı klasördeki `runtime.json`** çalışan örneğin gerçek adresini tutar.
+
+3. Hâlâ açılmıyorsa: tepsi simgesinden **Quit** deyin ya da Görev
+   Yöneticisi'nden `CloudTransfer.exe` süreçlerini kapatıp programı yeniden
+   başlatın.
+
+---
+
 ## Bilmeniz gerekenler
 
 - **Google Docs/Sheets/Slides** dosyaları Drive'dan çıkarken `.docx`/`.xlsx`/

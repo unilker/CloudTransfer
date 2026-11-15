@@ -18,6 +18,7 @@ same routes either way.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import logging.handlers
 import os
@@ -25,6 +26,8 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from pathlib import Path
 
@@ -44,6 +47,14 @@ HOST = "127.0.0.1"
 APP_MUTEX_NAME = "CloudTransferSingleInstance"
 
 _ERROR_ALREADY_EXISTS = 183
+
+# Where a running instance records the address it actually answers on, so a
+# second launch can find it instead of guessing at the default port.
+RUNTIME_FILE = "runtime.json"
+
+# How long a second launch waits for an instance that holds the lock but has
+# not finished starting yet.
+STARTUP_GRACE_SECONDS = 12.0
 
 
 def port_is_free(port: int, host: str = HOST) -> bool:
@@ -100,6 +111,95 @@ def ensure_standard_streams() -> None:
         sys.stdout = _NullStream()
     if sys.stderr is None:
         sys.stderr = _NullStream()
+
+
+def show_error(title: str, message: str) -> None:
+    """Put an error where the user will actually see it.
+
+    A windowed build has no console, so writing to stderr means the
+    application simply vanishes with no explanation.
+    """
+    log.error("%s: %s", title, message.replace("\n", " "))
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # MB_OK | MB_ICONERROR | MB_SETFOREGROUND
+            ctypes.windll.user32.MessageBoxW(None, message, title, 0x10 | 0x10000)
+            return
+        except Exception:  # pragma: no cover - best effort
+            pass
+    print(f"{title}\n{message}", file=sys.stderr)
+
+
+def runtime_path(data_dir: Path) -> Path:
+    return data_dir / RUNTIME_FILE
+
+
+def write_runtime(data_dir: Path, port: int, url: str) -> None:
+    """Record where this instance is serving, for the next launch to find."""
+    try:
+        runtime_path(data_dir).write_text(
+            json.dumps({"pid": os.getpid(), "port": port, "url": url}),
+            encoding="utf-8",
+        )
+    except OSError as exc:  # pragma: no cover - never fatal
+        log.debug("could not write the runtime file: %s", exc)
+
+
+def read_runtime(data_dir: Path) -> dict | None:
+    try:
+        return json.loads(runtime_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def clear_runtime(data_dir: Path) -> None:
+    try:
+        runtime_path(data_dir).unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - never fatal
+        pass
+
+
+def is_our_server(port: int, host: str = HOST, timeout: float = 1.5) -> bool:
+    """Check that what answers on this port is actually CloudTransfer.
+
+    A bare TCP connect is not enough: port 8765 could belong to anything, and
+    sending the user to someone else's service would be worse than useless.
+    """
+    # No proxy: a system proxy must never stand between us and loopback.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"http://{host}:{port}/healthz", timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read(512).decode("utf-8", "replace"))
+            return "status" in payload and "version" in payload
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return False
+
+
+def find_running_instance(data_dir: Path, preferred: int) -> str | None:
+    """Return the URL of an instance that answers, or ``None`` if none does.
+
+    Checks the port the last instance recorded first, then the preferred one,
+    then the rest of the scan range - an earlier run may have moved up.
+    """
+    candidates: list[int] = []
+    recorded = read_runtime(data_dir)
+    if recorded and isinstance(recorded.get("port"), int):
+        candidates.append(recorded["port"])
+    candidates.append(preferred)
+    candidates.extend(range(preferred, preferred + PORT_SCAN_LIMIT))
+
+    seen: set[int] = set()
+    for port in candidates:
+        if port in seen or not 0 < port < 65536:
+            continue
+        seen.add(port)
+        if already_running(port) and is_our_server(port):
+            return f"http://{HOST}:{port}"
+    return None
 
 
 def configure_file_logging(data_dir: Path) -> Path:
@@ -310,16 +410,39 @@ def run_desktop(
     lock = SingleInstanceLock()
     lock.acquire()
 
-    # A second launch should bring the first one forward, not fail to bind.
-    if lock.already_running or already_running(preferred):
-        url = f"http://{HOST}:{preferred}"
-        log.info("CloudTransfer is already running at %s", url)
+    # A second launch should bring the first one forward. The lock only says
+    # that some instance exists, never where it is listening, so the address
+    # has to be confirmed before a browser is pointed at it - otherwise the
+    # user gets a refused connection instead of the application.
+    existing = find_running_instance(settings.data_dir, preferred)
+
+    if existing is None and lock.already_running:
+        # Another process holds the lock but is not answering yet. Most likely
+        # it is still starting up, so give it a moment before concluding it is
+        # wedged.
+        log.info("another instance holds the lock; waiting for it to come up")
+        deadline = time.monotonic() + STARTUP_GRACE_SECONDS
+        while time.monotonic() < deadline and existing is None:
+            time.sleep(0.4)
+            existing = find_running_instance(settings.data_dir, preferred)
+
+    if existing is not None:
+        log.info("CloudTransfer is already running at %s", existing)
         if open_browser:
-            webbrowser.open(url)
-        print(f"CloudTransfer is already running at {url}")
+            webbrowser.open(existing)
+        print(f"CloudTransfer is already running at {existing}")
         lock.release()
         return 0
 
+    if lock.already_running:
+        # The lock is held by something that never started serving. Carrying on
+        # is better than exiting silently and leaving the user with nothing.
+        log.warning(
+            "a CloudTransfer process holds the lock but serves nothing; "
+            "starting a server anyway"
+        )
+
+    clear_runtime(settings.data_dir)
     chosen = find_port(preferred)
     url = f"http://{HOST}:{chosen}"
     # Redirect URIs are built from the address the browser actually used, and
@@ -332,14 +455,18 @@ def run_desktop(
     if not wait_until_serving(chosen):
         server.stop()
         lock.release()
-        message = (
-            f"CloudTransfer could not start on {url}.\n"
-            f"See the log at {log_path} for details."
+        clear_runtime(settings.data_dir)
+        detail = f"\n\n{server.error}" if server.error else ""
+        show_error(
+            "CloudTransfer could not start",
+            f"The application could not start its local server on {url}.{detail}"
+            f"\n\nThe log file has the details:\n{log_path}",
         )
-        print(message, file=sys.stderr)
-        log.error("server did not come up on port %d", chosen)
         return 1
 
+    # Record the real address before the browser is opened, so a second launch
+    # finds this instance even if it had to move off the default port.
+    write_runtime(settings.data_dir, chosen, url)
     log.info("CloudTransfer is serving at %s (log: %s)", url, log_path)
     if open_browser:
         webbrowser.open(url)
@@ -352,6 +479,8 @@ def run_desktop(
                 log.info("no system tray available (%s); staying in the console", exc)
         return _run_console(url, server)
     finally:
-        # Release it promptly, so an installer started right after the window
-        # closes does not still see the application as running.
+        # Release both promptly, so an installer started right after the window
+        # closes does not still see the application as running, and the next
+        # launch does not chase an address nothing answers on.
+        clear_runtime(settings.data_dir)
         lock.release()

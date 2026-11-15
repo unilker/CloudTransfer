@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
+import os
 import pathlib
 import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -19,11 +23,18 @@ from cloudtransfer.desktop import (
     SingleInstanceLock,
     _NullStream,
     already_running,
+    clear_runtime,
     configure_file_logging,
     ensure_standard_streams,
     find_port,
+    find_running_instance,
+    is_our_server,
     port_is_free,
+    read_runtime,
+    runtime_path,
+    show_error,
     wait_until_serving,
+    write_runtime,
 )
 
 
@@ -255,3 +266,124 @@ def test_the_running_app_message_says_where_to_look():
     assert "notification area" in message
     assert "Task Manager" in message
     assert "CloudTransfer.exe" in message
+
+
+# ------------------------------------------------- finding a running instance
+
+
+class _Handler(BaseHTTPRequestHandler):
+    """Stands in for whatever happens to be listening on a port."""
+
+    payload = b'{"status": "ok", "version": "1.0.0"}'
+
+    def do_GET(self):  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self.path != "/healthz":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(self.payload)))
+        self.end_headers()
+        self.wfile.write(self.payload)
+
+    def log_message(self, *_args):
+        return
+
+
+@contextlib.contextmanager
+def _serving(payload: bytes | None = None):
+    """Run a one-endpoint HTTP server on a free port."""
+    handler = type("H", (_Handler,), {"payload": payload or _Handler.payload})
+    server = HTTPServer((HOST, 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_our_own_server_is_recognised():
+    with _serving() as port:
+        assert is_our_server(port) is True
+
+
+def test_a_stranger_on_the_port_is_not_mistaken_for_us():
+    """Port 8765 could belong to anything; opening it would be worse than useless."""
+    with _serving(payload=b'{"hello": "some other service"}') as port:
+        assert is_our_server(port) is False
+
+
+def test_a_dead_port_is_not_ours():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((HOST, 0))
+        port = probe.getsockname()[1]
+    assert is_our_server(port, timeout=0.5) is False
+
+
+def test_a_socket_that_accepts_but_never_answers_is_not_ours():
+    """A bare TCP connect succeeding proves nothing."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((HOST, 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        assert already_running(port) is True   # the old, insufficient check
+        assert is_our_server(port, timeout=0.5) is False
+    finally:
+        listener.close()
+
+
+def test_a_moved_instance_is_found_through_the_runtime_file(tmp_path):
+    """The regression this guards: the second launch opened the default port
+    and showed a refused connection when the first had moved elsewhere."""
+    with _serving() as port:
+        write_runtime(tmp_path, port, f"http://{HOST}:{port}")
+        found = find_running_instance(tmp_path, DEFAULT_PORT)
+    assert found == f"http://{HOST}:{port}"
+
+
+def test_no_instance_is_reported_when_nothing_answers(tmp_path):
+    assert find_running_instance(tmp_path, DEFAULT_PORT) is None
+
+
+def test_a_stale_runtime_file_does_not_produce_a_dead_url(tmp_path):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((HOST, 0))
+        dead_port = probe.getsockname()[1]
+    write_runtime(tmp_path, dead_port, f"http://{HOST}:{dead_port}")
+    assert find_running_instance(tmp_path, DEFAULT_PORT) is None
+
+
+def test_the_runtime_file_round_trips(tmp_path):
+    assert read_runtime(tmp_path) is None
+    write_runtime(tmp_path, 8765, "http://127.0.0.1:8765")
+
+    recorded = read_runtime(tmp_path)
+    assert recorded["port"] == 8765
+    assert recorded["url"] == "http://127.0.0.1:8765"
+    assert recorded["pid"] == os.getpid()
+
+    clear_runtime(tmp_path)
+    assert read_runtime(tmp_path) is None
+    clear_runtime(tmp_path)  # removing it twice is harmless
+
+
+def test_a_corrupt_runtime_file_is_ignored(tmp_path):
+    runtime_path(tmp_path).write_text("{not json at all", encoding="utf-8")
+    assert read_runtime(tmp_path) is None
+    assert find_running_instance(tmp_path, DEFAULT_PORT) is None
+
+
+def test_a_runtime_file_with_a_nonsense_port_is_ignored(tmp_path):
+    runtime_path(tmp_path).write_text('{"port": "eight thousand"}', encoding="utf-8")
+    assert find_running_instance(tmp_path, DEFAULT_PORT) is None
+
+
+def test_errors_are_shown_without_raising(monkeypatch, capsys):
+    """A windowed build has no console, so this must never be the failure."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    show_error("A title", "A message\nover two lines")
+    assert "A title" in capsys.readouterr().err
