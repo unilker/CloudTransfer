@@ -30,9 +30,15 @@ import httpx
 from .errors import AuthError
 from .http import build_client, request_with_retry
 
-# Read-only on the source: this app never needs to modify Google Drive.
+# Full Drive access, because files travel both ways. Read-only would be enough
+# to send files to OneDrive, but not to receive them: creating a file inside a
+# folder the user already has requires write access to Drive, and the narrower
+# "drive.file" scope only reaches files this app itself created.
+GOOGLE_WRITE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
+    GOOGLE_WRITE_SCOPE,
     "openid",
     "email",
 ]
@@ -45,6 +51,16 @@ MS_SCOPES = [
 ]
 
 PROVIDERS = ("google", "microsoft")
+
+
+def google_can_write(granted_scope: str | None) -> bool:
+    """Whether a stored Google grant allows writing to Drive.
+
+    An account connected before transfers ran both ways holds only the
+    read-only scope. Nothing refreshes that: the user has to reconnect, and
+    saying so beats letting the first upload fail with a bare 403.
+    """
+    return GOOGLE_WRITE_SCOPE in (granted_scope or "").split()
 
 HUMAN_NAMES = {"google": "Google Drive", "microsoft": "OneDrive"}
 

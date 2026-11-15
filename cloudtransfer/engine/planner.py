@@ -21,12 +21,19 @@ import logging
 
 from sqlalchemy import delete, select
 
-from ..config import ONEDRIVE_MAX_FILE_SIZE, Settings, get_settings
+from ..config import Settings, get_settings
 from ..db import session_scope
 from ..errors import SkipFile
-from ..models import FileTask, Job, JobStatus, TaskStatus
-from ..naming import check_path_length, dedupe_name, join_path, sanitize_name
-from ..providers.gdrive import GoogleDriveSource, is_native
+from ..models import Direction, FileTask, Job, JobStatus, TaskStatus
+from ..naming import (
+    POLICIES,
+    NamingPolicy,
+    check_path_length,
+    dedupe_name,
+    join_path,
+    sanitize_name,
+)
+from ..providers.base import SourceProvider
 
 log = logging.getLogger(__name__)
 
@@ -49,10 +56,11 @@ class PlannedFile:
 
 
 async def _collect(
-    source: GoogleDriveSource,
+    source: SourceProvider,
     root_id: str,
     *,
     include_trashed: bool,
+    policy: NamingPolicy,
 ) -> list[PlannedFile]:
     """Walk the source tree, resolving names and export formats as we go."""
     planned: list[PlannedFile] = []
@@ -90,8 +98,8 @@ async def _collect(
                     continue
 
             if child.is_folder:
-                safe, reasons = sanitize_name(child.name, fallback="folder")
-                safe, renamed = dedupe_name(safe, taken)
+                safe, reasons = sanitize_name(child.name, policy, fallback="folder")
+                safe, renamed = dedupe_name(safe, taken, policy)
                 if renamed:
                     reasons.append("renamed to avoid a name already used in this folder")
                 if reasons:
@@ -116,9 +124,9 @@ async def _collect(
             except SkipFile as exc:
                 skip_reason = str(exc)
 
-            safe, reasons = sanitize_name(base_name)
+            safe, reasons = sanitize_name(base_name, policy)
             notes.extend(reasons)
-            safe, renamed = dedupe_name(safe, taken)
+            safe, renamed = dedupe_name(safe, taken, policy)
             if renamed:
                 notes.append("renamed to avoid a name already used in this folder")
 
@@ -126,12 +134,13 @@ async def _collect(
             if skip_reason is None:
                 if not child.can_download:
                     skip_reason = "this account is not allowed to download the file"
-                elif size > ONEDRIVE_MAX_FILE_SIZE:
+                elif size > policy.max_file_size:
                     skip_reason = (
-                        f"{size} bytes exceeds OneDrive's 250 GB per-file limit"
+                        f"{size} bytes exceeds {policy.provider}'s "
+                        f"{policy.max_file_size_label} per-file limit"
                     )
 
-            warning = check_path_length(join_path(rel_path, safe))
+            warning = check_path_length(join_path(rel_path, safe), policy)
             if warning:
                 notes.append(warning)
                 if skip_reason is None:
@@ -150,7 +159,9 @@ async def _collect(
                     dest_name=safe,
                     notes=notes,
                     skip_reason=skip_reason,
-                    size_is_estimate=bool(export_mime) or is_native(child.mime_type),
+                    # A converted document's final size is unknown until the
+                    # export arrives, so what is recorded now is a guess.
+                    size_is_estimate=bool(export_mime) or child.size is None,
                 )
             )
 
@@ -161,7 +172,7 @@ async def _collect(
 
 async def plan_job(
     job_id: int,
-    source: GoogleDriveSource,
+    source: SourceProvider,
     settings: Settings | None = None,
 ) -> int:
     """Populate a job's file tasks and totals. Returns the number of files.
@@ -178,9 +189,19 @@ async def plan_job(
         job.status = JobStatus.PLANNING
         root_id = job.source_folder_id
         include_trashed = job.include_trashed
+        direction = job.direction
 
-    log.info("planning job %d from Drive folder %s", job_id, root_id)
-    planned = await _collect(source, root_id, include_trashed=include_trashed)
+    # Names have to satisfy the destination, which depends on the direction.
+    _, dest_side = Direction.SIDES.get(direction, ("gdrive", "onedrive"))
+    policy = POLICIES[dest_side]
+
+    log.info(
+        "planning job %d (%s) from folder %s, naming for %s",
+        job_id, direction, root_id, policy.provider,
+    )
+    planned = await _collect(
+        source, root_id, include_trashed=include_trashed, policy=policy
+    )
 
     async with session_scope(settings) as session:
         job = await session.get(Job, job_id)

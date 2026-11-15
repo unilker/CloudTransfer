@@ -1,14 +1,20 @@
 # CloudTransfer
 
-Moves files from Google Drive to OneDrive **without writing them to a disk**.
-Each file is read from Drive in byte ranges, held one chunk at a time in
-memory, and pushed straight into a OneDrive upload session. There is no
-temporary directory, no partial file left behind, and a 200 GB file costs the
-same memory as a 200 MB one.
+Moves files between Google Drive and OneDrive, **in either direction**, and
+**without writing them to a disk**. Each file is read in byte ranges, held one
+chunk at a time in memory, and pushed straight into the other side's upload
+session. There is no temporary directory, no partial file left behind, and a
+200 GB file costs the same memory as a 200 MB one.
 
 ```
-Google Drive ──GET (Range)──▶ [ one chunk in RAM ] ──PUT (Content-Range)──▶ OneDrive
+source ──GET (Range)──▶ [ one chunk in RAM ] ──PUT (Content-Range)──▶ destination
 ```
+
+The direction is a switch in the interface. The engine is the same either way;
+what changes is which provider reads and which writes, and therefore which
+rules apply — Microsoft wants upload chunks in multiples of 320 KiB and Google
+in multiples of 256 KiB, OneDrive forbids characters Drive accepts, Drive
+allows duplicate names where OneDrive does not.
 
 ---
 
@@ -56,16 +62,23 @@ the hashes cover only part of the content, and the report says *not verified*
 instead of guessing.
 
 **Google Docs, Sheets and Slides.** Native Google formats have no bytes to
-copy. They are exported to `.docx` / `.xlsx` / `.pptx` so they stay editable in
-Office. This is the one path that buffers a whole file, because Graph needs the
-total size up front and an export's size is unknown until it arrives — Google
-caps exports at 10 MB, so the buffer is bounded. Forms, Sites and My Maps
-cannot be exported at all and are reported as skipped, with the reason.
+copy. On the way out they are exported to `.docx` / `.xlsx` / `.pptx` so they
+stay editable in Office. This is the one path that buffers a whole file,
+because the destination needs the total size up front and an export's size is
+unknown until it arrives — Google caps exports at 10 MB, so the buffer is
+bounded. Forms, Sites and My Maps cannot be exported at all and are reported as
+skipped, with the reason.
+
+Coming the other way nothing needs converting: every OneDrive file is already
+real bytes. The exception is a package — a OneNote notebook — which has no
+single stream to copy and is skipped with its reason.
 
 **Renames, never silent.** OneDrive rejects `" * : < > ? / \ |`, reserves
 Windows device names, and treats names as unique per folder — while Drive
-allows two identical siblings and a folder and file sharing a name. Every
-rewrite is recorded on the file and appears in the job report.
+allows two identical siblings and a folder and file sharing a name. Which rules
+apply depends on where the files are going, so a name rewritten on the way to
+OneDrive passes through untouched on the way to Drive. Every rewrite is
+recorded on the file and appears in the job report.
 
 **Throttling.** Both providers answer a 429 with `Retry-After`. That hint is
 honoured instead of guessing, with exponential backoff and jitter otherwise.
@@ -144,7 +157,17 @@ be handed access to your Drive or OneDrive on your behalf.
 4. **Credentials -> Create credentials -> OAuth client ID -> Desktop app.**
 5. Paste the client ID and secret into the setup step.
 
-Scope used: `drive.readonly`. This program never modifies your Drive.
+Scope used: `https://www.googleapis.com/auth/drive`. Full access is needed
+because files travel both ways: read-only would be enough to send files to
+OneDrive, but not to receive them. The narrower `drive.file` scope does not
+help, since it only reaches files this program itself created — it cannot put a
+file into a folder you already have.
+
+> **Upgrading from an earlier version?** A Google account connected before
+> transfers ran both ways holds a read-only grant, and no refresh widens it.
+> Transfers *into* Drive are refused with a message saying so; disconnect
+> Google Drive in step 2 and connect it again to fix it. Transfers out of Drive
+> keep working either way.
 
 ### Microsoft
 
@@ -226,10 +249,12 @@ upload.
 - **Drive-native formats become Office files.** The converted document is a
   different artifact, so Drive's checksum no longer applies to it; only the
   destination side is verified.
+- **OneNote notebooks cannot be copied.** They are packages rather than files,
+  with no single stream to read.
 - **Shared drives** are readable if the connected account can see them. Folder
   shortcut loops are detected and not followed twice.
-- **Nothing is deleted from Drive.** Access is read-only by design; this copies,
-  it does not move.
+- **Nothing is ever deleted.** Whichever way a job runs, this copies; it does
+  not move, and it removes nothing from the source.
 
 ---
 
@@ -256,6 +281,8 @@ a second, independently written implementation.
 | Area | File |
 |---|---|
 | Streaming, chunking, resume, verification | `tests/test_relay.py` |
+| OneDrive to Google Drive, end to end | `tests/test_reverse.py` |
+| Drive's resumable upload protocol | `tests/test_gdrive_dest.py` |
 | PKCE, public clients, stored credentials | `tests/test_oauth.py` |
 | Port selection, console-less launch | `tests/test_desktop.py` |
 | Drive adapter over mocked HTTP | `tests/test_gdrive.py` |
@@ -277,8 +304,8 @@ cloudtransfer/
   oauth.py           authorization-code flow for both providers
   accounts.py        token storage and refresh
   providers/
-    gdrive.py        source: listing, Range reads, exports
-    onedrive.py      destination: upload sessions, chunked PUTs
+    gdrive.py        Drive as source (Range reads, exports) and destination
+    onedrive.py      OneDrive as source and destination (upload sessions)
   engine/
     planner.py       walk the tree, settle every destination name
     transfer.py      the relay itself

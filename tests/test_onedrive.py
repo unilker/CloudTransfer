@@ -14,8 +14,14 @@ import pytest
 import respx
 
 from cloudtransfer.config import ONEDRIVE_CHUNK_MULTIPLE, Settings
-from cloudtransfer.errors import NotFoundError, ProviderError
-from cloudtransfer.providers.onedrive import GRAPH, OneDriveDest, _encode_path
+from cloudtransfer.errors import NotFoundError, ProviderError, SkipFile
+from cloudtransfer.providers.base import RemoteItem
+from cloudtransfer.providers.onedrive import (
+    GRAPH,
+    OneDriveDest,
+    OneDriveSource,
+    _encode_path,
+)
 
 SESSION_URL = "https://upload.example.invalid/session/abc123"
 
@@ -335,3 +341,124 @@ async def test_missing_item_raises_not_found(dest):
     with pytest.raises(NotFoundError):
         await dest.get_item("nope")
     await dest.close()
+
+
+# ---------------------------------------------------------------- source side
+
+
+@pytest.fixture
+def source(tmp_path) -> OneDriveSource:
+    settings = Settings(data_dir=tmp_path, secret_key="k", max_retries=1)
+    return OneDriveSource(_token, settings)
+
+
+async def _drain(agen) -> bytes:
+    out = bytearray()
+    async for piece in agen:
+        out.extend(piece)
+    return bytes(out)
+
+
+@respx.mock
+async def test_download_streams_the_content_endpoint(source):
+    payload = b"onedrive bytes" * 100
+    route = respx.get(url__regex=rf"{GRAPH}/me/drive/items/o1/content").mock(
+        return_value=httpx.Response(200, content=payload)
+    )
+    item = RemoteItem(id="o1", name="a.bin", size=len(payload))
+
+    assert await _drain(source.open_stream(item)) == payload
+    assert "Range" not in route.calls[0].request.headers
+    await source.close()
+
+
+@respx.mock
+async def test_resume_sends_a_range_header(source):
+    payload = b"0123456789" * 50
+    start = 120
+    route = respx.get(url__regex=rf"{GRAPH}/me/drive/items/o1/content").mock(
+        return_value=httpx.Response(
+            206,
+            content=payload[start:],
+            headers={"Content-Range": f"bytes {start}-{len(payload) - 1}/{len(payload)}"},
+        )
+    )
+    item = RemoteItem(id="o1", name="a.bin", size=len(payload))
+
+    assert await _drain(source.open_stream(item, start=start)) == payload[start:]
+    assert route.calls[0].request.headers["Range"] == f"bytes={start}-"
+    await source.close()
+
+
+@respx.mock
+async def test_a_server_that_ignores_range_does_not_corrupt_the_resume(source):
+    """A proxy may strip Range; correctness must not depend on it."""
+    payload = bytes(range(256)) * 4
+    start = 300
+    respx.get(url__regex=rf"{GRAPH}/me/drive/items/o1/content").mock(
+        return_value=httpx.Response(200, content=payload)
+    )
+    item = RemoteItem(id="o1", name="a.bin", size=len(payload))
+    assert await _drain(source.open_stream(item, start=start)) == payload[start:]
+    await source.close()
+
+
+@respx.mock
+async def test_a_download_error_is_classified(source):
+    respx.get(url__regex=rf"{GRAPH}/me/drive/items/o1/content").mock(
+        return_value=httpx.Response(403, json={"error": {"code": "accessDenied"}})
+    )
+    item = RemoteItem(id="o1", name="locked.bin", size=10)
+    with pytest.raises(ProviderError):
+        await _drain(source.open_stream(item))
+    await source.close()
+
+
+async def test_a_package_has_no_stream_to_read(source):
+    item = RemoteItem(id="o1", name="Notebook", extra={"package_type": "oneNote"})
+    with pytest.raises(SkipFile, match="OneNote"):
+        source.plan_transfer_name(item)
+    with pytest.raises(SkipFile):
+        await _drain(source.open_stream(item))
+    await source.close()
+
+
+def test_ordinary_files_need_no_conversion(source):
+    name, export_mime = source.plan_transfer_name(
+        RemoteItem(id="o1", name="Report.docx", mime_type="application/vnd...")
+    )
+    assert name == "Report.docx"
+    assert export_mime is None
+
+
+async def test_exporting_is_not_a_thing_here(source):
+    with pytest.raises(ProviderError, match="does not need exporting"):
+        await source.export_to_memory(RemoteItem(id="o1", name="a.bin"), "text/plain")
+    await source.close()
+
+
+@respx.mock
+async def test_the_package_facet_is_carried_through(source):
+    respx.get(url__regex=rf"{GRAPH}/me/drive/items/o1\?.*").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": "o1", "name": "Team notebook", "package": {"type": "oneNote"}},
+        )
+    )
+    item = await source.get_item("o1")
+    assert item.extra["package_type"] == "oneNote"
+    await source.close()
+
+
+@respx.mock
+async def test_listing_resolves_the_root_alias(source):
+    respx.get(url__regex=rf"{GRAPH}/me/drive/root.*").mock(
+        return_value=httpx.Response(200, json={"id": "root1", "name": "root", "folder": {}})
+    )
+    children = respx.get(url__regex=rf"{GRAPH}/me/drive/items/root1/children.*").mock(
+        return_value=httpx.Response(200, json={"value": [_file_payload("a.bin")]})
+    )
+    items = await source.list_children("root")
+    assert [i.name for i in items] == ["a.bin"]
+    assert children.called
+    await source.close()

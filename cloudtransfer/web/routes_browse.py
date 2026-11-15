@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..errors import NotFoundError, ProviderError
 from ..providers.base import RemoteItem
-from ..providers.gdrive import GoogleDriveSource, is_native
+from ..providers.gdrive import GoogleDriveDest, GoogleDriveSource, is_native
 from ..providers.onedrive import OneDriveDest
-from .deps import drive_source, onedrive_dest
+from .deps import drive_dest, drive_source, onedrive_dest
 
 router = APIRouter(prefix="/api/browse")
 
@@ -67,6 +67,35 @@ async def shared_drives(source: GoogleDriveSource = Depends(drive_source)) -> di
     return {"drives": [{"id": d.id, "name": d.name} for d in drives]}
 
 
+@router.post("/drive/folder")
+async def create_drive_folder(
+    parent: str = Query(..., description="Parent Drive folder ID, or 'root'"),
+    name: str = Query(..., min_length=1, max_length=255),
+    dest: GoogleDriveDest = Depends(drive_dest),
+) -> dict:
+    """Create a destination folder in Drive without leaving the picker."""
+    from ..naming import GOOGLE_DRIVE, sanitize_name
+
+    safe, reasons = sanitize_name(name, GOOGLE_DRIVE, fallback="New folder")
+    parent_id = parent
+    if parent == "root":
+        parent_id = (await dest.get_root()).id
+    try:
+        folder = await dest.ensure_folder(parent_id, safe)
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"folder": _serialize(folder, side="drive"), "renamed_because": reasons}
+
+
+@router.get("/drive/quota")
+async def drive_quota(dest: GoogleDriveDest = Depends(drive_dest)) -> dict:
+    try:
+        remaining, total = await dest.get_quota()
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"remaining": remaining, "total": total}
+
+
 @router.get("/onedrive")
 async def browse_onedrive(
     parent: str = Query("root", description="OneDrive item ID, or 'root'"),
@@ -103,9 +132,9 @@ async def create_folder(
     dest: OneDriveDest = Depends(onedrive_dest),
 ) -> dict:
     """Create a destination folder without leaving the picker."""
-    from ..naming import sanitize_name
+    from ..naming import ONEDRIVE, sanitize_name
 
-    safe, reasons = sanitize_name(name, fallback="New folder")
+    safe, reasons = sanitize_name(name, ONEDRIVE, fallback="New folder")
     parent_id = parent
     if parent == "root":
         parent_id = (await dest.get_root()).id

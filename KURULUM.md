@@ -1,8 +1,12 @@
 # Kurulum (Türkçe)
 
-CloudTransfer, Google Drive'daki dosyaları **diske hiç yazmadan** OneDrive'a
-aktarır. Dosya, Drive'dan parça parça okunur, bellekte tek bir parça tutulur ve
-doğrudan OneDrive'a yazılır. Geçici klasör yoktur, yarım dosya kalmaz.
+CloudTransfer, Google Drive ile OneDrive arasında **her iki yönde** ve
+**diske hiç yazmadan** dosya aktarır. Dosya kaynaktan parça parça okunur,
+bellekte tek bir parça tutulur ve doğrudan hedefe yazılır. Geçici klasör
+yoktur, yarım dosya kalmaz.
+
+Yön, arayüzdeki bir düğmeyle seçilir: **Google Drive → OneDrive** ya da
+**OneDrive → Google Drive**.
 
 > **Önemli:** İki bulutu birbiriyle doğrudan konuşturmak mümkün değil. Google
 > Drive'ın "şu adrese gönder" diye bir API'si yok; Microsoft'un "URL'den yükle"
@@ -67,8 +71,15 @@ verilemiyor.
 5. Çıkan **Client ID** ve **Client secret** değerlerini programdaki 1. adıma
    yapıştırıp **Save** deyin.
 
-Kullanılan izin `drive.readonly`'dir — program Drive'ınızda hiçbir değişiklik
-yapmaz.
+Kullanılan izin `https://www.googleapis.com/auth/drive`'dır. Tam erişim
+gerekiyor, çünkü dosyalar iki yönde de gidiyor: salt okuma izni Drive'dan
+OneDrive'a göndermeye yeter ama OneDrive'dan Drive'a **almaya** yetmez.
+
+> **Daha önceki bir sürümü kullandıysanız:** O zaman bağladığınız Google hesabı
+> salt okunur izinle bağlıdır ve bu izin kendiliğinden genişlemez. Drive'a
+> **doğru** yapılan aktarımlar açık bir mesajla reddedilir. Düzeltmek için
+> 2. adımda Google Drive'ı **Disconnect** edip yeniden bağlayın. Drive'dan
+> **dışarı** aktarım her durumda çalışmaya devam eder.
 
 ### Microsoft tarafı
 
@@ -95,8 +106,9 @@ karşınıza çıkmaz.
 ## 3. Kullanım
 
 1. 2. adımda iki hesabı da **Connect** ile bağlayın.
-2. 3. adımda soldan Drive klasörünü, sağdan OneDrive klasörünü seçin.
-3. Aynı isim varsa ne olacağını seçip **Start transfer** deyin.
+2. 3. adımda önce **yönü** seçin (ya da **Swap** ile ters çevirin).
+3. Soldan kaynak klasörü, sağdan hedef klasörü seçin.
+4. Aynı isim varsa ne olacağını seçip **Start transfer** deyin.
 
 Aktarım sırasında duraklatabilirsiniz; kaldığı **baytdan** devam eder. Bittiğinde
 **Download report** ile her dosyanın durumunu, yeniden adlandırmaları ve atlanan
@@ -106,14 +118,20 @@ dosyaların gerekçelerini CSV olarak indirebilirsiniz.
 
 ## Bilmeniz gerekenler
 
-- **Google Docs/Sheets/Slides** dosyaları `.docx`/`.xlsx`/`.pptx` olarak
-  dönüştürülür. Google'ın dışa aktarma sınırı 10 MB'dır; bunu aşanlar gerekçesi
-  yazılarak atlanır.
+- **Google Docs/Sheets/Slides** dosyaları Drive'dan çıkarken `.docx`/`.xlsx`/
+  `.pptx` olarak dönüştürülür. Google'ın dışa aktarma sınırı 10 MB'dır; bunu
+  aşanlar gerekçesi yazılarak atlanır.
 - **Google Forms, Sites ve My Maps** dışa aktarılamaz; bunlar atlanır.
-- **OneDrive'ın kabul etmediği karakterler** (`" * : < > ? / \ |`) değiştirilir,
-  aynı klasördeki aynı isimli dosyalar numaralandırılır. Her değişiklik rapora
-  yazılır.
-- **Drive'dan hiçbir şey silinmez.** Erişim salt okunurdur; bu bir kopyalamadır.
+- **OneNote defterleri** kopyalanamaz; tek bir dosya değil, paket oldukları
+  için atlanır.
+- Ters yönde (OneDrive → Drive) hiçbir dönüştürme yapılmaz, çünkü OneDrive'daki
+  her dosya zaten gerçek bayttır.
+- **OneDrive'ın kabul etmediği karakterler** (`" * : < > ? / \ |`) OneDrive'a
+  giderken değiştirilir, aynı klasördeki aynı isimli dosyalar numaralandırılır.
+  Drive'a giderken böyle bir kısıt olmadığı için isimler olduğu gibi kalır. Her
+  değişiklik rapora yazılır.
+- **Hiçbir şeyi silmez.** Hangi yönde olursa olsun bu bir kopyalamadır;
+  kaynaktan dosya kaldırılmaz.
 - Her dosya aktarımdan sonra karma (hash) ile doğrulanır.
 - Program 8765 numaralı portu kullanır. Meşgulse bir üstünü dener; o durumda
   1. adımdaki yönlendirme adresi de değişir ve ekranda güncel hâli görünür.

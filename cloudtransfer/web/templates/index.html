@@ -13,7 +13,7 @@
     <span class="logo" aria-hidden="true">&#9729;</span>
     <div>
       <h1>CloudTransfer</h1>
-      <p class="tagline">Google Drive &rarr; OneDrive, streamed in {{ "%.0f"|format(chunk_size / 1048576) }} MiB chunks. Nothing is written to disk.</p>
+      <p class="tagline">Google Drive and OneDrive, either way, streamed in {{ "%.0f"|format(chunk_size / 1048576) }} MiB chunks. Nothing is written to disk.</p>
     </div>
   </div>
   <div class="meta">v{{ version }} &middot; {{ parallel }} files in parallel</div>
@@ -141,7 +141,12 @@
           <span class="pill pill-idle" data-role="state">checking&hellip;</span>
         </div>
         <p class="account-who" data-role="who"></p>
-        <p class="account-note">Read-only access. This app never modifies your Drive.</p>
+        <p class="account-note">Read and write, so files can travel either way.</p>
+        <p class="account-warn" data-role="readonly-warning" hidden>
+          This account is connected with read-only access, so files cannot be
+          written into Drive. Disconnect and connect again to transfer
+          <strong>from OneDrive into Google Drive</strong>.
+        </p>
         <div class="account-actions">
           <a class="btn btn-primary" data-role="connect" href="/auth/google/start">Connect</a>
           <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
@@ -154,7 +159,7 @@
           <span class="pill pill-idle" data-role="state">checking&hellip;</span>
         </div>
         <p class="account-who" data-role="who"></p>
-        <p class="account-note">Read and write, so files can be created.</p>
+        <p class="account-note">Read and write, so files can travel either way.</p>
         <div class="account-actions">
           <a class="btn btn-primary" data-role="connect" href="/auth/microsoft/start">Connect</a>
           <button class="btn btn-quiet" data-role="disconnect" hidden>Disconnect</button>
@@ -166,10 +171,27 @@
   <!-- 3. Pick folders --------------------------------------------------- -->
   <section class="card" id="pick-section">
     <h2><span class="step">3</span> Choose what moves where</h2>
+    <div class="direction" role="radiogroup" aria-label="Transfer direction">
+      <span class="direction-label">Direction</span>
+      <div class="segmented">
+        <button type="button" class="seg is-active" role="radio" aria-checked="true"
+                data-direction="gdrive_to_onedrive">
+          Google&nbsp;Drive <span aria-hidden="true">&rarr;</span> OneDrive
+        </button>
+        <button type="button" class="seg" role="radio" aria-checked="false"
+                data-direction="onedrive_to_gdrive">
+          OneDrive <span aria-hidden="true">&rarr;</span> Google&nbsp;Drive
+        </button>
+      </div>
+      <button type="button" class="btn btn-small" id="swap" title="Swap the two sides">
+        &#8646; Swap
+      </button>
+    </div>
+
     <div class="pickers">
       <div class="picker" id="picker-source">
         <div class="picker-head">
-          <h3>From Google Drive</h3>
+          <h3 data-role="title">From Google Drive</h3>
           <button class="btn btn-small" data-role="up">&uarr; Up</button>
         </div>
         <nav class="crumbs" data-role="crumbs"></nav>
@@ -179,7 +201,7 @@
 
       <div class="picker" id="picker-dest">
         <div class="picker-head">
-          <h3>To OneDrive</h3>
+          <h3 data-role="title">To OneDrive</h3>
           <span>
             <button class="btn btn-small" data-role="newfolder">+ Folder</button>
             <button class="btn btn-small" data-role="up">&uarr; Up</button>
@@ -239,7 +261,10 @@
       <p><strong>Google Docs, Sheets and Slides are converted.</strong> Native
       Google formats have no bytes to copy, so they are exported to
       .docx/.xlsx/.pptx on the way out. Google caps that export at 10&nbsp;MB,
-      and files above it are reported as skipped rather than silently dropped.</p>
+      and files above it are reported as skipped rather than silently dropped.
+      Coming the other way nothing needs converting, since every OneDrive
+      file is already real bytes &mdash; except a OneNote notebook, which is a
+      package with no single stream to copy.</p>
 
       <p><strong>Interrupted transfers resume.</strong> OneDrive remembers how
       much of each upload it holds. After a pause, a crash or a network drop,

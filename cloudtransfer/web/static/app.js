@@ -90,27 +90,73 @@ $('#modal-input').addEventListener('keydown', (event) => {
 
 // ---------------------------------------------------------------- picker
 
+// Everything that differs between the two providers, in one place.
+const PROVIDERS = {
+  gdrive: {
+    key: 'gdrive',
+    name: 'Google Drive',
+    endpoint: '/api/browse/drive',
+    rootLabel: 'My Drive',
+    canCreateFolders: true,
+  },
+  onedrive: {
+    key: 'onedrive',
+    name: 'OneDrive',
+    endpoint: '/api/browse/onedrive',
+    rootLabel: 'OneDrive',
+    canCreateFolders: true,
+  },
+};
+
+const DIRECTIONS = {
+  gdrive_to_onedrive: { source: 'gdrive', dest: 'onedrive' },
+  onedrive_to_gdrive: { source: 'onedrive', dest: 'gdrive' },
+};
+
 class Picker {
-  constructor(rootId, { endpoint, rootLabel, side }) {
+  constructor(rootId, role) {
     this.root = $(`#${rootId}`);
-    this.endpoint = endpoint;
-    this.side = side;
-    this.stack = [{ id: 'root', name: rootLabel }];
+    this.role = role;              // 'source' or 'dest'
+    this.provider = null;
+    this.stack = [];
     this.selected = null;
     this.ready = false;
 
     this.listing = $('[data-role="listing"]', this.root);
     this.crumbs = $('[data-role="crumbs"]', this.root);
     this.pickedBox = $('[data-role="picked"]', this.root);
+    this.title = $('[data-role="title"]', this.root);
+    this.newFolderButton = $('[data-role="newfolder"]', this.root);
 
     $('[data-role="up"]', this.root).addEventListener('click', () => this.up());
-    const newFolder = $('[data-role="newfolder"]', this.root);
-    if (newFolder) newFolder.addEventListener('click', () => this.createFolder());
+    if (this.newFolderButton) {
+      this.newFolderButton.addEventListener('click', () => this.createFolder());
+    }
+  }
 
-    // Until the matching account is connected there is nothing to list, so say
-    // so rather than showing an empty box.
+  get endpoint() { return this.provider.endpoint; }
+
+  /** Point this panel at a provider, discarding whatever was selected. */
+  configure(providerKey) {
+    const next = PROVIDERS[providerKey];
+    if (this.provider && this.provider.key === next.key) return;
+    this.provider = next;
+    this.stack = [{ id: 'root', name: next.rootLabel }];
+    this.selected = null;
+    this.ready = false;
+
+    this.title.textContent =
+      (this.role === 'source' ? 'From ' : 'To ') + next.name;
+    if (this.newFolderButton) {
+      // Only the destination needs new folders, and only where we can make them.
+      this.newFolderButton.hidden = this.role !== 'dest' || !next.canCreateFolders;
+    }
+    this.crumbs.innerHTML = '';
+    this.pickedBox.classList.remove('set');
+    this.pickedBox.textContent = 'Nothing selected';
     this.listing.innerHTML =
-      `<li class="empty-row">Connect ${escapeHtml(rootLabel === 'My Drive' ? 'Google Drive' : 'OneDrive')} to browse your folders.</li>`;
+      `<li class="empty-row">Connect ${escapeHtml(next.name)} to browse your folders.</li>`;
+    refreshStartButton();
   }
 
   get current() { return this.stack[this.stack.length - 1]; }
@@ -224,15 +270,60 @@ class Picker {
   }
 }
 
-const sourcePicker = new Picker('picker-source', {
-  endpoint: '/api/browse/drive',
-  rootLabel: 'My Drive',
-  side: 'drive',
+const sourcePicker = new Picker('picker-source', 'source');
+const destPicker = new Picker('picker-dest', 'dest');
+
+let direction = 'gdrive_to_onedrive';
+let readonlyWarningShown = false;
+
+function applyDirection(next, { reload = true } = {}) {
+  direction = next;
+  const sides = DIRECTIONS[direction];
+
+  $$('.segmented .seg').forEach((button) => {
+    const active = button.dataset.direction === direction;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-checked', active ? 'true' : 'false');
+  });
+
+  sourcePicker.configure(sides.source);
+  destPicker.configure(sides.dest);
+
+  if (direction === 'onedrive_to_gdrive' && connected.google && !googleCanWrite) {
+    banner.show(
+      'Google Drive is connected with read-only access. Disconnect it in step 2 ' +
+      'and connect again to transfer files into Drive.',
+      'warn',
+      false
+    );
+    readonlyWarningShown = true;
+  } else if (readonlyWarningShown) {
+    // Only clear our own message; the banner may be showing something else,
+    // such as the confirmation after an account was just connected.
+    banner.hide();
+    readonlyWarningShown = false;
+  }
+
+  if (reload) {
+    if (connected[providerToAccount(sides.source)]) sourcePicker.enable();
+    if (connected[providerToAccount(sides.dest)]) destPicker.enable();
+  }
+  refreshStartButton();
+}
+
+/** Which connected account a provider's data lives behind. */
+function providerToAccount(providerKey) {
+  return providerKey === 'gdrive' ? 'google' : 'microsoft';
+}
+
+$$('.segmented .seg').forEach((button) => {
+  button.addEventListener('click', () => applyDirection(button.dataset.direction));
 });
-const destPicker = new Picker('picker-dest', {
-  endpoint: '/api/browse/onedrive',
-  rootLabel: 'OneDrive',
-  side: 'onedrive',
+
+$('#swap').addEventListener('click', () => {
+  applyDirection(
+    direction === 'gdrive_to_onedrive' ? 'onedrive_to_gdrive' : 'gdrive_to_onedrive'
+  );
 });
 
 // ---------------------------------------------------------------- setup
@@ -391,6 +482,9 @@ $('#setup-toggle').addEventListener('click', () => {
 // ---------------------------------------------------------------- accounts
 
 let connected = { google: false, microsoft: false };
+// A Google account connected before transfers ran both ways holds a read-only
+// grant, which no refresh can widen.
+let googleCanWrite = true;
 
 function renderAccount(provider, info, isConfigured) {
   const card = $(`#acct-${provider}`);
@@ -420,10 +514,14 @@ async function loadStatus() {
     const status = await api('/api/status');
     connected = { google: !!status.google, microsoft: !!status.microsoft };
     configured = status.configured;
+    googleCanWrite = !status.google || status.google.can_write !== false;
+    const warning = $('#acct-google [data-role="readonly-warning"]');
+    if (warning) warning.hidden = googleCanWrite;
     renderAccount('google', status.google, status.configured.google);
     renderAccount('microsoft', status.microsoft, status.configured.microsoft);
-    if (connected.google) sourcePicker.enable();
-    if (connected.microsoft) destPicker.enable();
+    const sides = DIRECTIONS[direction];
+    if (connected[providerToAccount(sides.source)]) sourcePicker.enable();
+    if (connected[providerToAccount(sides.dest)]) destPicker.enable();
     refreshStartButton();
   } catch (error) {
     banner.show(`Could not read status: ${error.message}`, 'error', false);
@@ -455,6 +553,9 @@ function refreshStartButton() {
   if (!connected.microsoft) reasons.push('connect OneDrive');
   if (!sourcePicker.selected) reasons.push('pick a source folder');
   if (!destPicker.selected) reasons.push('pick a destination folder');
+  if (direction === 'onedrive_to_gdrive' && connected.google && !googleCanWrite) {
+    reasons.push('reconnect Google Drive for write access');
+  }
 
   if (reasons.length) {
     button.disabled = true;
@@ -474,6 +575,7 @@ $('#start').addEventListener('click', async () => {
     const job = await api('/api/jobs', {
       method: 'POST',
       body: JSON.stringify({
+        direction,
         source_folder_id: sourcePicker.selected.id,
         source_folder_name: sourcePicker.selected.path,
         dest_folder_id: destPicker.selected.id,
@@ -552,7 +654,8 @@ function jobCard(job) {
       <div class="job-top">
         <div class="job-route">
           #${job.id} ${escapeHtml(job.source_folder_name || job.source_folder_id)}
-          <span class="arrow">→</span>${escapeHtml(job.dest_folder_path || 'OneDrive')}
+          <span class="arrow">→</span>${escapeHtml(job.dest_folder_path || '')}
+          <span class="job-direction">${escapeHtml(job.direction_label || '')}</span>
         </div>
         <span class="job-status s-${job.status}">${escapeHtml(statusLabel(job.status))}</span>
       </div>
@@ -696,6 +799,7 @@ async function refreshJobs() {
     banner.show(params.get('error'), 'error', false);
     history.replaceState({}, '', location.pathname);
   }
+  applyDirection(direction, { reload: false });
   (async () => {
     const complete = await loadSetup();
     // A returning user has already done the paperwork; lead with the transfer.

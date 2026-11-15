@@ -38,6 +38,9 @@ class RemoteItem:
 
     can_download: bool = True
     trashed: bool = False
+    # Set where a provider knows an item is a folder through a secondary
+    # facet rather than the primary one (a OneDrive shared folder, say).
+    is_folder_hint: bool = False
     extra: dict = field(default_factory=dict)
 
     @property
@@ -99,7 +102,11 @@ class DestProvider(Protocol):
         self, parent_id: str, name: str, *, size: int, conflict: str
     ) -> UploadSession: ...
 
-    async def session_next_offset(self, session_url: str) -> int | None:
+    # Non-final chunks must be a multiple of this many bytes. OneDrive wants
+    # 320 KiB and Google 256 KiB, so the engine asks rather than assuming.
+    chunk_multiple: int
+
+    async def session_next_offset(self, session_url: str, total: int) -> int | None:
         """Bytes the destination already holds, or ``None`` if the session is
         gone (expired, cancelled, or already committed)."""
         ...

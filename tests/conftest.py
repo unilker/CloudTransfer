@@ -1,14 +1,20 @@
 """In-memory stand-ins for Google Drive and OneDrive.
 
-The fake OneDrive enforces the constraints Microsoft Graph actually enforces -
-the 320 KiB chunk multiple, offsets that must line up, a total size that must
-match - so a test passing here means the engine is obeying the real rules, not
-just the ones it happens to remember.
+One class plays both roles, exactly as the real adapters do: each provider can
+be the source of a transfer or its destination, and a test picks which. That is
+what makes both directions testable against the production engine rather than
+against a simplified imitation of it.
+
+The fakes enforce the constraints the real services enforce - the per-provider
+chunk multiple, offsets that must line up, a declared total that must match,
+OneDrive's unique names against Drive's duplicates - so a passing test means
+the engine obeys the real rules.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import os
 from collections.abc import AsyncIterator
@@ -18,8 +24,11 @@ import pytest
 from cloudtransfer.config import ONEDRIVE_CHUNK_MULTIPLE, Settings
 from cloudtransfer.errors import NotFoundError, ProviderError, RetryableError, SkipFile
 from cloudtransfer.providers.base import RemoteItem, UploadSession
-from cloudtransfer.providers.gdrive import FOLDER_MIME, GoogleDriveSource
+from cloudtransfer.providers.gdrive import FOLDER_MIME, GOOGLE_CHUNK_MULTIPLE
+from cloudtransfer.providers.gdrive import GoogleDriveSource as _RealDriveSource
 from cloudtransfer.quickxor import quickxorhash
+
+_ids = itertools.count(1)
 
 
 @pytest.fixture
@@ -27,100 +36,172 @@ def settings(tmp_path) -> Settings:
     return Settings(
         data_dir=tmp_path / "data",
         secret_key="test-secret",
-        chunk_size=ONEDRIVE_CHUNK_MULTIPLE * 2,  # 640 KiB, small enough to be fast
+        # A multiple of both providers' chunk rules (320 KiB and 256 KiB), so
+        # neither destination has to round it down in tests.
+        chunk_size=1_310_720,
         # Force the streaming path for modest payloads; in production this is
         # 4 MiB, but tests should not need multi-megabyte fixtures to reach it.
-        simple_upload_max=ONEDRIVE_CHUNK_MULTIPLE // 2,
+        simple_upload_max=100_000,
         max_parallel_files=2,
         max_retries=4,
         verify_hashes=True,
     )
 
 
-# --------------------------------------------------------------- fake Drive
+# --------------------------------------------------------------------- nodes
 
 
-_drive_ids = itertools.count(1)
-
-
-class FakeDriveFile:
-    def __init__(self, name, content=b"", mime="application/octet-stream", parent="root"):
-        self.id = f"d{next(_drive_ids)}"
+class FakeNode:
+    def __init__(self, name, parent, *, is_folder=False, content=b"", mime=""):
+        self.id = f"n{next(_ids)}"
         self.name = name
-        self.content = content
-        self.mime = mime
         self.parent = parent
+        self.is_folder = is_folder
+        self.content = content
+        self.mime = mime or (FOLDER_MIME if is_folder else "application/octet-stream")
         self.can_download = True
         self.trashed = False
         self.export_payloads: dict[str, bytes] = {}
         self.shortcut_target: str | None = None
-        # Override the size Drive reports, to stand in for a file too big for
-        # OneDrive without allocating it.
+        self.package_type: str | None = None
+        # Override the size the provider reports, to stand in for a file too
+        # large for the destination without allocating it.
         self.reported_size: int | None = None
 
 
-class FakeDrive:
-    """Minimal Drive: folders, files, Range reads, exports, fault injection."""
+class FakeUpload:
+    def __init__(self, parent, name, total, conflict):
+        self.parent = parent
+        self.name = name
+        self.total = total
+        self.conflict = conflict
+        self.buffer = bytearray()
+        self.committed = False
+        self.alive = True
 
-    def __init__(self) -> None:
-        self.items: dict[str, FakeDriveFile] = {}
+
+# --------------------------------------------------------------------- cloud
+
+
+class FakeCloud:
+    """A provider that can act as either end of a transfer.
+
+    ``provider`` is ``"gdrive"`` or ``"onedrive"``, which decides the chunk
+    multiple it enforces, whether sibling names must be unique, and whether it
+    has native documents that need exporting.
+    """
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        self.is_drive = provider == "gdrive"
+        self.chunk_multiple = (
+            GOOGLE_CHUNK_MULTIPLE if self.is_drive else ONEDRIVE_CHUNK_MULTIPLE
+        )
+        # OneDrive treats one name per folder as unique; Drive does not.
+        self.unique_names = not self.is_drive
+
+        self.root = FakeNode("My Drive" if self.is_drive else "OneDrive", None, is_folder=True)
+        self.items: dict[str, FakeNode] = {self.root.id: self.root}
+        self.sessions: dict[str, FakeUpload] = {}
+        self._session_counter = 0
+
+        # -- observation
         self.reads: list[tuple[str, int]] = []
-        # file id -> drop the stream after this many bytes, once
-        self.fail_after: dict[str, int] = {}
-        self.range_supported = True
+        self.chunk_log: list[tuple[str, int, int]] = []
+        self.ensure_folder_calls: list[tuple[str, str]] = []
 
-    # -- construction helpers
-    def add_folder(self, name: str, parent: str = "root") -> FakeDriveFile:
-        folder = FakeDriveFile(name, mime=FOLDER_MIME, parent=parent)
-        self.items[folder.id] = folder
-        return folder
+        # -- fault injection
+        self.fail_after: dict[str, int] = {}
+        self.fail_chunk_at: dict[str, int] = {}
+        self.expire_session_at: dict[str, int] = {}
+        self.fail_permanently: set[str] = set()
+        self.range_supported = True
+        self.chunk_delay = 0.0
+        self.quota_remaining: int | None = 10 * 1024**4
+
+    # -- construction ------------------------------------------------------
+
+    def _resolve(self, parent_id: str | None) -> str:
+        if parent_id in (None, "", "root"):
+            return self.root.id
+        return parent_id
+
+    def add_folder(self, name: str, parent: str = "root") -> FakeNode:
+        node = FakeNode(name, self._resolve(parent), is_folder=True)
+        self.items[node.id] = node
+        return node
 
     def add_file(self, name, content=b"", mime="application/octet-stream", parent="root"):
-        entry = FakeDriveFile(name, content=content, mime=mime, parent=parent)
-        self.items[entry.id] = entry
-        return entry
+        node = FakeNode(name, self._resolve(parent), content=content, mime=mime)
+        self.items[node.id] = node
+        return node
 
     def add_native(self, name, mime, exports: dict[str, bytes], parent="root"):
-        entry = FakeDriveFile(name, mime=mime, parent=parent)
-        entry.export_payloads = exports
-        self.items[entry.id] = entry
-        return entry
+        """A Google-native document, which has no bytes of its own."""
+        node = FakeNode(name, self._resolve(parent), mime=mime)
+        node.export_payloads = exports
+        self.items[node.id] = node
+        return node
 
-    # -- provider surface
-    def _to_item(self, entry: FakeDriveFile) -> RemoteItem:
-        import hashlib
+    def add_package(self, name, package_type="oneNote", parent="root"):
+        """A OneDrive package, such as a OneNote notebook."""
+        node = FakeNode(name, self._resolve(parent))
+        node.package_type = package_type
+        self.items[node.id] = node
+        return node
 
-        is_native = entry.mime.startswith("application/vnd.google-apps.")
-        if is_native:
+    # -- mapping -----------------------------------------------------------
+
+    def _children(self, parent_id: str) -> list[FakeNode]:
+        parent_id = self._resolve(parent_id)
+        return [n for n in self.items.values() if n.parent == parent_id]
+
+    def _to_item(self, node: FakeNode) -> RemoteItem:
+        native = node.mime.startswith("application/vnd.google-apps.") and not node.is_folder
+        if node.is_folder or native:
             size = None
-        elif entry.reported_size is not None:
-            size = entry.reported_size
+        elif node.reported_size is not None:
+            size = node.reported_size
         else:
-            size = len(entry.content)
+            size = len(node.content)
+
+        extra = {}
+        if node.package_type:
+            extra["package_type"] = node.package_type
+
         return RemoteItem(
-            id=entry.id,
-            name=entry.name,
-            mime_type=entry.mime,
+            id=node.id,
+            name=node.name,
+            mime_type=node.mime,
             size=size,
-            is_folder=entry.mime == FOLDER_MIME,
-            md5=None if is_native else hashlib.md5(entry.content).hexdigest(),
-            parent_id=entry.parent,
-            can_download=entry.can_download,
-            trashed=entry.trashed,
-            shortcut_target_id=entry.shortcut_target,
+            is_folder=node.is_folder,
+            md5=None if (node.is_folder or native) else hashlib.md5(node.content).hexdigest(),
+            quick_xor=None if (node.is_folder or native) else quickxorhash(node.content),
+            parent_id=node.parent,
+            can_download=node.can_download,
+            trashed=node.trashed,
+            shortcut_target_id=node.shortcut_target,
+            extra=extra,
         )
 
-    async def get_item(self, item_id: str) -> RemoteItem:
-        entry = self.items.get(item_id)
-        if entry is None:
-            raise NotFoundError(f"no such Drive item {item_id}", status=404)
-        return self._to_item(entry)
+    # ======================================================= source interface
 
-    async def list_children(self, folder_id: str, *, include_trashed: bool = False):
+    async def get_root(self) -> RemoteItem:
+        return self._to_item(self.root)
+
+    async def get_item(self, item_id: str) -> RemoteItem:
+        node = self.items.get(self._resolve(item_id))
+        if node is None:
+            raise NotFoundError(f"no such item {item_id}", status=404)
+        return self._to_item(node)
+
+    async def list_children(
+        self, folder_id: str, *, include_trashed: bool = False
+    ) -> list[RemoteItem]:
         return [
-            self._to_item(e)
-            for e in self.items.values()
-            if e.parent == folder_id and (include_trashed or not e.trashed)
+            self._to_item(n)
+            for n in self._children(folder_id)
+            if include_trashed or not n.trashed
         ]
 
     async def resolve_shortcut(self, item: RemoteItem) -> RemoteItem:
@@ -130,20 +211,31 @@ class FakeDrive:
         target.name = item.name
         return target
 
-    # Reuse the production naming/export decision so tests cover the real one.
-    plan_transfer_name = GoogleDriveSource.plan_transfer_name
+    def plan_transfer_name(self, item: RemoteItem) -> tuple[str, str | None]:
+        """Reuse the production decision for Drive; OneDrive converts nothing."""
+        if self.is_drive:
+            return _RealDriveSource.plan_transfer_name(self, item)
+        if item.extra.get("package_type"):
+            raise SkipFile(
+                f"items stored as a '{item.extra['package_type']}' package "
+                f"cannot be downloaded"
+            )
+        return item.name, None
 
     async def open_stream(self, item: RemoteItem, *, start: int = 0) -> AsyncIterator[bytes]:
-        entry = self.items[item.id]
-        # The real adapter refuses these two cases; the fake must too, or the
-        # engine could regress into sending a zero-byte Google Doc.
-        if entry.mime.startswith("application/vnd.google-apps."):
+        node = self.items[item.id]
+        # The real adapters refuse these; the fakes must too, or the engine
+        # could regress into sending a zero-byte document.
+        if node.mime.startswith("application/vnd.google-apps.") and not node.is_folder:
             raise ProviderError(f"{item.name!r} is native and has no byte stream")
-        if not entry.can_download:
+        if node.package_type:
+            raise SkipFile(f"{item.name!r} is a package and cannot be downloaded")
+        if not node.can_download:
             raise SkipFile(f"this account may not download {item.name!r}")
+
         self.reads.append((item.id, start))
 
-        data = entry.content
+        data = node.content
         if self.range_supported:
             data = data[start:]
             emitted_base = start
@@ -165,77 +257,28 @@ class FakeDrive:
             yield piece
 
     async def export_to_memory(self, item: RemoteItem, export_mime: str) -> bytes:
-        entry = self.items[item.id]
-        if export_mime not in entry.export_payloads:
+        node = self.items[item.id]
+        if export_mime not in node.export_payloads:
             raise ProviderError(f"cannot export {item.name} as {export_mime}", status=400)
-        return entry.export_payloads[export_mime]
+        return node.export_payloads[export_mime]
 
-    async def close(self) -> None:
-        return None
+    async def list_shared_drives(self) -> list[RemoteItem]:
+        return []
 
-
-# ------------------------------------------------------------ fake OneDrive
-
-
-_one_ids = itertools.count(1)
-
-
-class FakeOneItem:
-    def __init__(self, name, parent, is_folder=False, content=b""):
-        self.id = f"o{next(_one_ids)}"
-        self.name = name
-        self.parent = parent
-        self.is_folder = is_folder
-        self.content = content
-
-
-class FakeUpload:
-    def __init__(self, parent, name, total, conflict):
-        self.parent = parent
-        self.name = name
-        self.total = total
-        self.conflict = conflict
-        self.buffer = bytearray()
-        self.committed = False
-        self.alive = True
-
-
-class FakeOneDrive:
-    """Minimal OneDrive that enforces Graph's upload-session rules."""
-
-    def __init__(self) -> None:
-        self.root = FakeOneItem("OneDrive", parent=None, is_folder=True)
-        self.items: dict[str, FakeOneItem] = {self.root.id: self.root}
-        self.sessions: dict[str, FakeUpload] = {}
-        self._counter = 0
-        self.chunk_log: list[tuple[str, int, int]] = []
-        # name -> fail the PUT that would cross this byte offset, once
-        self.fail_chunk_at: dict[str, int] = {}
-        self.expire_session_at: dict[str, int] = {}
-        self.quota_remaining: int | None = 10 * 1024**4
-        # Names that always fail, standing in for a permission or policy error.
-        self.fail_permanently: set[str] = set()
-        # Artificial per-chunk delay, so pause/cancel tests have a window to
-        # land in rather than racing an in-memory transfer to completion.
-        self.chunk_delay: float = 0.0
-        self.ensure_folder_calls: list[tuple[str, str]] = []
-
-    # -- helpers
-    def _children(self, parent_id):
-        return [i for i in self.items.values() if i.parent == parent_id]
-
-    def _to_item(self, entry: FakeOneItem) -> RemoteItem:
-        return RemoteItem(
-            id=entry.id,
-            name=entry.name,
-            size=None if entry.is_folder else len(entry.content),
-            is_folder=entry.is_folder,
-            quick_xor=None if entry.is_folder else quickxorhash(entry.content),
-            parent_id=entry.parent,
-        )
+    # ================================================== destination interface
 
     def _free_name(self, parent_id, name, conflict):
-        existing = {i.name.casefold(): i for i in self._children(parent_id)}
+        """Apply the destination's own conflict behaviour."""
+        siblings = self._children(parent_id)
+        if not self.unique_names:
+            # Drive keeps duplicates happily; only "replace" looks for a match.
+            if conflict == "replace":
+                for node in siblings:
+                    if node.name == name and not node.is_folder:
+                        return name, node
+            return name, None
+
+        existing = {n.name.casefold(): n for n in siblings}
         if name.casefold() not in existing:
             return name, None
         if conflict == "fail":
@@ -253,56 +296,55 @@ class FakeOneDrive:
         return f"{stem} ({n}){ext}", None
 
     def _store(self, parent_id, name, content, conflict):
+        parent_id = self._resolve(parent_id)
         final, replacing = self._free_name(parent_id, name, conflict)
         if replacing is not None:
             replacing.content = content
             return replacing
-        entry = FakeOneItem(final, parent_id, content=content)
-        self.items[entry.id] = entry
-        return entry
-
-    # -- provider surface
-    async def get_root(self) -> RemoteItem:
-        return self._to_item(self.root)
-
-    async def get_item(self, item_id: str) -> RemoteItem:
-        entry = self.items.get(item_id)
-        if entry is None:
-            raise NotFoundError(f"no such OneDrive item {item_id}", status=404)
-        return self._to_item(entry)
-
-    async def list_children(self, folder_id: str):
-        return [self._to_item(i) for i in self._children(folder_id)]
+        node = FakeNode(final, parent_id, content=content)
+        self.items[node.id] = node
+        return node
 
     async def find_child(self, parent_id: str, name: str) -> RemoteItem | None:
-        for entry in self._children(parent_id):
-            if entry.name.casefold() == name.casefold():
-                return self._to_item(entry)
+        for node in self._children(parent_id):
+            matches = (
+                node.name.casefold() == name.casefold()
+                if self.unique_names
+                else node.name == name
+            )
+            if matches:
+                return self._to_item(node)
         return None
 
     async def ensure_folder(self, parent_id: str, name: str) -> RemoteItem:
+        parent_id = self._resolve(parent_id)
         self.ensure_folder_calls.append((parent_id, name))
         found = await self.find_child(parent_id, name)
         if found is not None and found.is_folder:
             return found
-        entry = FakeOneItem(name, parent_id, is_folder=True)
-        self.items[entry.id] = entry
-        return self._to_item(entry)
+        node = FakeNode(name, parent_id, is_folder=True)
+        self.items[node.id] = node
+        return self._to_item(node)
 
     async def create_upload_session(self, parent_id, name, *, size, conflict="rename"):
         if name in self.fail_permanently:
             raise ProviderError(f"access denied for {name}", status=403)
         if self.quota_remaining is not None and size > self.quota_remaining:
             raise ProviderError("insufficient storage", status=507)
-        self._counter += 1
-        url = f"https://fake-upload.invalid/session/{self._counter}"
-        self.sessions[url] = FakeUpload(parent_id, name, size, conflict)
+        self._session_counter += 1
+        url = f"https://fake-upload.invalid/{self.provider}/{self._session_counter}"
+        self.sessions[url] = FakeUpload(self._resolve(parent_id), name, size, conflict)
         return UploadSession(url=url)
 
-    async def session_next_offset(self, session_url: str) -> int | None:
+    async def session_next_offset(self, session_url: str, total: int = 0) -> int | None:
         session = self.sessions.get(session_url)
         if session is None or not session.alive or session.committed:
             return None
+        if total and total != session.total:
+            raise ProviderError(
+                f"status query states {total} bytes, session declared {session.total}",
+                status=400,
+            )
         return len(session.buffer)
 
     async def put_chunk(self, session_url, data, offset, total):
@@ -323,9 +365,10 @@ class FakeOneDrive:
 
         end = offset + len(data) - 1
         is_last = end == total - 1
-        if not is_last and len(data) % ONEDRIVE_CHUNK_MULTIPLE != 0:
+        if not is_last and len(data) % self.chunk_multiple != 0:
             raise ProviderError(
-                f"chunk of {len(data)} bytes is not a multiple of 320 KiB", status=400
+                f"chunk of {len(data)} bytes is not a multiple of "
+                f"{self.chunk_multiple}", status=400
             )
 
         trip = self.fail_chunk_at.get(session.name)
@@ -344,10 +387,10 @@ class FakeOneDrive:
 
         if len(session.buffer) >= session.total:
             session.committed = True
-            entry = self._store(
+            node = self._store(
                 session.parent, session.name, bytes(session.buffer), session.conflict
             )
-            return self._to_item(entry)
+            return self._to_item(node)
         return None
 
     async def cancel_session(self, session_url: str) -> None:
@@ -369,33 +412,34 @@ class FakeOneDrive:
     async def close(self) -> None:
         return None
 
-    # -- assertions helpers
+    # -- assertions --------------------------------------------------------
+
     def read_file(self, parent_id, name) -> bytes:
-        for entry in self._children(parent_id):
-            if entry.name == name:
-                return entry.content
-        raise AssertionError(f"{name!r} is not in the destination")
+        for node in self._children(parent_id):
+            if node.name == name:
+                return node.content
+        raise AssertionError(f"{name!r} is not in {self.provider}")
 
     def tree(self, parent_id=None, prefix="") -> dict[str, bytes]:
-        parent_id = parent_id or self.root.id
+        parent_id = self._resolve(parent_id)
         out: dict[str, bytes] = {}
-        for entry in self._children(parent_id):
-            path = f"{prefix}/{entry.name}" if prefix else entry.name
-            if entry.is_folder:
-                out.update(self.tree(entry.id, path))
+        for node in self._children(parent_id):
+            path = f"{prefix}/{node.name}" if prefix else node.name
+            if node.is_folder:
+                out.update(self.tree(node.id, path))
             else:
-                out[path] = entry.content
+                out[path] = node.content
         return out
 
 
 @pytest.fixture
-def drive() -> FakeDrive:
-    return FakeDrive()
+def drive() -> FakeCloud:
+    return FakeCloud("gdrive")
 
 
 @pytest.fixture
-def onedrive() -> FakeOneDrive:
-    return FakeOneDrive()
+def onedrive() -> FakeCloud:
+    return FakeCloud("onedrive")
 
 
 @pytest.fixture
@@ -429,16 +473,17 @@ async def db(settings):
 @pytest.fixture
 async def job_factory(db):
     from cloudtransfer.db import session_scope
-    from cloudtransfer.models import Job, JobStatus
+    from cloudtransfer.models import Direction, Job, JobStatus
 
     async def make(source_folder_id: str, dest_folder_id: str, **kw) -> int:
         async with session_scope(db) as session:
             job = Job(
                 status=JobStatus.PENDING,
+                direction=kw.pop("direction", Direction.GDRIVE_TO_ONEDRIVE),
                 source_folder_id=source_folder_id,
                 source_folder_name=kw.pop("source_folder_name", "source"),
                 dest_folder_id=dest_folder_id,
-                dest_folder_path=kw.pop("dest_folder_path", "OneDrive"),
+                dest_folder_path=kw.pop("dest_folder_path", "destination"),
                 **kw,
             )
             session.add(job)

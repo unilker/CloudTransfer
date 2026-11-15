@@ -25,10 +25,10 @@ from ..config import Settings, get_settings
 from ..db import session_scope
 from ..errors import AuthError, CloudTransferError, ProviderError, SkipFile
 from ..http import build_client
-from ..models import ConflictPolicy, FileTask, Job, JobStatus, TaskStatus
+from ..models import ConflictPolicy, Direction, FileTask, Job, JobStatus, TaskStatus
 from ..naming import join_path
-from ..providers.gdrive import GoogleDriveSource
-from ..providers.onedrive import OneDriveDest
+from ..providers.gdrive import GoogleDriveDest, GoogleDriveSource
+from ..providers.onedrive import OneDriveDest, OneDriveSource
 from .planner import plan_job
 from .transfer import FileTransfer
 
@@ -40,6 +40,26 @@ PROGRESS_FLUSH_SECONDS = 1.0
 
 class JobStopped(CloudTransferError):
     """Raised inside the relay to unwind a paused or cancelled job."""
+
+
+def build_providers(direction: str, settings: Settings, client):
+    """Return the (source, destination) pair this direction calls for.
+
+    Both accounts are needed either way; which one reads and which one writes
+    is the only thing that changes.
+    """
+    google = TokenManager("google", settings)
+    microsoft = TokenManager("microsoft", settings)
+
+    if direction == Direction.ONEDRIVE_TO_GDRIVE:
+        return (
+            OneDriveSource(microsoft.get_token, settings, client=client),
+            GoogleDriveDest(google.get_token, settings, client=client),
+        )
+    return (
+        GoogleDriveSource(google.get_token, settings, client=client),
+        OneDriveDest(microsoft.get_token, settings, client=client),
+    )
 
 
 @dataclass
@@ -145,12 +165,14 @@ class JobRunner:
         stop = self._stops[job_id]
         live = self._progress[job_id]
 
-        google = TokenManager("google", self.settings)
-        microsoft = TokenManager("microsoft", self.settings)
+        async with session_scope(self.settings) as session:
+            job = await session.get(Job, job_id)
+            if job is None:
+                raise ValueError(f"job {job_id} does not exist")
+            direction = job.direction
 
         async with build_client() as client:
-            source = GoogleDriveSource(google.get_token, self.settings, client=client)
-            dest = OneDriveDest(microsoft.get_token, self.settings, client=client)
+            source, dest = build_providers(direction, self.settings, client)
 
             async with session_scope(self.settings) as session:
                 job = await session.get(Job, job_id)
@@ -259,8 +281,8 @@ class JobRunner:
         *,
         task_id: int,
         job_id: int,
-        source: GoogleDriveSource,
-        dest: OneDriveDest,
+        source,
+        dest,
         resolve_folder,
         semaphore: asyncio.Semaphore,
         stop: asyncio.Event,

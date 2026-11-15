@@ -184,6 +184,18 @@ class FileTransfer:
         if self._on_session is not None:
             await self._on_session(url)
 
+    @property
+    def chunk_size(self) -> int:
+        """The configured chunk size, rounded down to what this destination takes.
+
+        OneDrive demands multiples of 320 KiB and Google of 256 KiB, so one
+        configured value cannot satisfy both exactly. Rounding down keeps the
+        request legal and never exceeds what the operator asked for.
+        """
+        multiple = getattr(self.dest, "chunk_multiple", 0) or 1
+        rounded = (self.settings.chunk_size // multiple) * multiple
+        return max(rounded, multiple)
+
     # -- entry point --------------------------------------------------------
 
     async def transfer(
@@ -313,7 +325,7 @@ class FileTransfer:
 
     async def _push_buffer(self, session_url: str, data: bytes, total: int) -> RemoteItem | None:
         """Upload an in-memory buffer through an existing session."""
-        chunk = self.settings.chunk_size
+        chunk = self.chunk_size
         offset = 0
         dest_item: RemoteItem | None = None
         while offset < total:
@@ -339,7 +351,7 @@ class FileTransfer:
 
         if session_url:
             # Make sure the stored session is still alive before trusting it.
-            offset = await self.dest.session_next_offset(session_url)
+            offset = await self.dest.session_next_offset(session_url, total)
             if offset is None:
                 # The session is either already committed or expired. Check for
                 # a finished file before sending anything: a process that died
@@ -377,7 +389,7 @@ class FileTransfer:
         hashes: Hashers | None = None
 
         while True:
-            offset = await self.dest.session_next_offset(session_url)
+            offset = await self.dest.session_next_offset(session_url, total)
 
             if offset is None:
                 # Graph says the session is finished or gone. If the file
@@ -471,7 +483,7 @@ class FileTransfer:
         hashes: Hashers | None,
     ) -> RemoteItem | None:
         """Stream from ``start`` to the end, one chunk in flight at a time."""
-        chunk_size = self.settings.chunk_size
+        chunk_size = self.chunk_size
         buffer = bytearray()
         offset = start
         dest_item: RemoteItem | None = None

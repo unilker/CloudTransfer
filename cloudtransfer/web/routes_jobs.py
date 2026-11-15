@@ -9,19 +9,21 @@ import json
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 
+from ..accounts import load_account
 from ..config import get_settings
 from ..db import session_scope
-from ..engine.worker import get_runner
+from ..engine.worker import build_providers, get_runner
 from ..errors import ProviderError
-from ..models import ConflictPolicy, FileTask, Job, JobStatus, TaskStatus
+from ..http import build_client
+from ..models import ConflictPolicy, Direction, FileTask, Job, JobStatus, TaskStatus
 from ..naming import join_path
-from ..providers.onedrive import OneDriveDest
-from .deps import onedrive_dest, require_account
+from ..oauth import google_can_write
+from .deps import require_account
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs")
@@ -30,6 +32,9 @@ SSE_POLL_SECONDS = 1.0
 
 
 class JobCreate(BaseModel):
+    direction: Literal["gdrive_to_onedrive", "onedrive_to_gdrive"] = (
+        Direction.GDRIVE_TO_ONEDRIVE
+    )
     source_folder_id: str = Field(..., min_length=1)
     source_folder_name: str = ""
     dest_folder_id: str = Field(..., min_length=1)
@@ -44,6 +49,8 @@ def _job_dict(job: Job) -> dict:
     return {
         "id": job.id,
         "status": job.status,
+        "direction": job.direction,
+        "direction_label": job.direction_label,
         "source_folder_id": job.source_folder_id,
         "source_folder_name": job.source_folder_name,
         "dest_folder_id": job.dest_folder_id,
@@ -116,25 +123,46 @@ async def _snapshot(job_id: int) -> dict:
 
 
 @router.post("")
-async def create_job(
-    body: JobCreate,
-    dest: OneDriveDest = Depends(onedrive_dest),
-) -> dict:
+async def create_job(body: JobCreate) -> dict:
+    # Both accounts are needed whichever way the files travel.
     await require_account("google")
+    await require_account("microsoft")
+
+    if body.direction == Direction.ONEDRIVE_TO_GDRIVE:
+        # Writing into Drive needs a grant the read-only connection never had,
+        # and no refresh can widen it. Catch it here rather than letting every
+        # file fail with a bare 403.
+        google = await load_account("google")
+        if google is not None and not google_can_write(google.scope):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This Google account is connected with read-only access, so "
+                    "files cannot be written into Drive. Disconnect Google Drive "
+                    "in step 2 and connect it again to grant write access."
+                ),
+            )
 
     dest_id = body.dest_folder_id
     dest_path = body.dest_folder_path
+
     if dest_id == "root":
-        try:
-            root = await dest.get_root()
-        except ProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # "root" means different things to the two providers, so ask whichever
+        # one is receiving this job.
+        settings = get_settings()
+        async with build_client() as client:
+            _, dest = build_providers(body.direction, settings, client)
+            try:
+                root = await dest.get_root()
+            except ProviderError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         dest_id = root.id
-        dest_path = dest_path or "OneDrive"
+        dest_path = dest_path or root.name
 
     async with session_scope() as session:
         job = Job(
             status=JobStatus.PENDING,
+            direction=body.direction,
             source_folder_id=body.source_folder_id,
             source_folder_name=body.source_folder_name,
             dest_folder_id=dest_id,
@@ -152,7 +180,10 @@ async def create_job(
         await get_runner().start(job_id)
         payload["status"] = JobStatus.PENDING
 
-    log.info("created job %d: %s -> %s", job_id, body.source_folder_name, dest_path)
+    log.info(
+        "created job %d (%s): %s -> %s",
+        job_id, body.direction, body.source_folder_name, dest_path,
+    )
     return payload
 
 
@@ -374,30 +405,35 @@ async def job_report(job_id: int, fmt: str = Query("csv", pattern="^(csv|json)$"
 
 
 @router.get("/{job_id}/preflight")
-async def preflight(job_id: int, dest: OneDriveDest = Depends(onedrive_dest)) -> dict:
+async def preflight(job_id: int) -> dict:
     """Compare what the job will move against the destination's free space."""
     async with session_scope() as session:
         job = await session.get(Job, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
         needed = job.total_bytes - job.done_bytes
+        direction = job.direction
 
-    try:
-        remaining, total = await dest.get_quota()
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    settings = get_settings()
+    async with build_client() as client:
+        _, dest = build_providers(direction, settings, client)
+        try:
+            remaining, total = await dest.get_quota()
+        except ProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     fits = None if remaining is None else needed <= remaining
     return {
         "bytes_to_move": needed,
+        "destination": Direction.SIDES[direction][1],
         "destination_remaining": remaining,
         "destination_total": total,
         "fits": fits,
         "warning": (
             None
             if fits is not False
-            else f"The job needs {needed} bytes but OneDrive reports only "
+            else f"The job needs {needed} bytes but the destination reports only "
                  f"{remaining} bytes free."
         ),
-        "settings": {"chunk_size": get_settings().chunk_size},
+        "settings": {"chunk_size": settings.chunk_size},
     }

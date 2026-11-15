@@ -18,9 +18,12 @@ from cloudtransfer.appconfig import (
 )
 from cloudtransfer.errors import AuthError, ConfigError
 from cloudtransfer.oauth import (
+    GOOGLE_READONLY_SCOPE,
+    GOOGLE_WRITE_SCOPE,
     OAuthApp,
     authorize_url,
     exchange_code,
+    google_can_write,
     new_pkce_verifier,
     new_state,
     pkce_challenge,
@@ -82,7 +85,9 @@ def test_authorize_url_carries_pkce_and_scopes():
     assert params["state"] == "state123"
     assert params["code_challenge"] == pkce_challenge(verifier)
     assert params["code_challenge_method"] == "S256"
-    assert "drive.readonly" in params["scope"]
+    # Full Drive access: read-only cannot receive files from OneDrive.
+    assert "https://www.googleapis.com/auth/drive" in params["scope"]
+    assert "drive.readonly" not in params["scope"]
     # Without these two Google issues no refresh token.
     assert params["access_type"] == "offline"
     assert params["prompt"] == "consent"
@@ -299,3 +304,22 @@ async def test_environment_backed_settings_are_marked_read_only(db):
     assert status["google"]["configured"] is True
     assert status["google"]["source"] == "env"
     assert status["google"]["editable"] is False
+
+
+# ------------------------------------------------- read-only grant detection
+
+
+def test_an_old_read_only_grant_is_recognised():
+    """Connections made before transfers ran both ways cannot write to Drive."""
+    assert google_can_write(f"{GOOGLE_READONLY_SCOPE} openid email") is False
+    assert google_can_write(f"{GOOGLE_WRITE_SCOPE} openid email") is True
+
+
+def test_a_missing_or_empty_scope_is_not_writable():
+    assert google_can_write(None) is False
+    assert google_can_write("") is False
+
+
+def test_the_check_is_not_fooled_by_a_prefix():
+    """drive.readonly contains the write scope as a prefix; it is still read-only."""
+    assert google_can_write(GOOGLE_READONLY_SCOPE) is False

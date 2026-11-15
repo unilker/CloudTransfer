@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from ..accounts import TokenManager, load_account
 from ..config import Settings, get_settings
 from ..http import build_client
-from ..providers.gdrive import GoogleDriveSource
+from ..providers.gdrive import GoogleDriveDest, GoogleDriveSource
 from ..providers.onedrive import OneDriveDest
 
 
@@ -31,6 +31,13 @@ async def drive_source() -> AsyncIterator[GoogleDriveSource]:
     settings = get_settings()
     async with build_client() as client:
         yield GoogleDriveSource(TokenManager("google", settings).get_token, settings, client=client)
+
+
+async def drive_dest() -> AsyncIterator[GoogleDriveDest]:
+    await require_account("google")
+    settings = get_settings()
+    async with build_client() as client:
+        yield GoogleDriveDest(TokenManager("google", settings).get_token, settings, client=client)
 
 
 async def onedrive_dest() -> AsyncIterator[OneDriveDest]:

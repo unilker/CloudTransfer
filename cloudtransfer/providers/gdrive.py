@@ -15,7 +15,9 @@ Three Drive behaviours shape this file:
 
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 
 import httpx
@@ -23,7 +25,7 @@ import httpx
 from ..config import Settings, get_settings
 from ..errors import NotFoundError, ProviderError, SkipFile
 from ..http import build_client, classify, request_with_retry
-from .base import RemoteItem, TokenGetter
+from .base import RemoteItem, TokenGetter, UploadSession
 
 log = logging.getLogger(__name__)
 
@@ -316,3 +318,341 @@ class GoogleDriveSource:
         if len(data) > EXPORT_SIZE_LIMIT:  # pragma: no cover - server-side guard
             log.warning("%r exported to %d bytes, above the documented limit", item.name, len(data))
         return data
+
+
+# ---------------------------------------------------------------------------
+# Destination side
+# ---------------------------------------------------------------------------
+
+UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+
+# Google's resumable upload requires every chunk but the last to be a multiple
+# of 256 KiB. OneDrive wants 320 KiB, so the two are deliberately kept as
+# per-provider facts rather than one shared constant.
+GOOGLE_CHUNK_MULTIPLE = 256 * 1024
+
+
+def _escape_query_value(value: str) -> str:
+    """Escape a value for a Drive ``q`` search string."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+class GoogleDriveDest:
+    """Write access to Google Drive, for transfers that land here.
+
+    The resumable protocol differs from Microsoft's in three ways that matter:
+    the session is opened with a POST whose ``Location`` header carries the
+    upload URL, progress is reported as ``308 Resume Incomplete`` with a
+    ``Range`` header rather than a JSON body, and the status query is a PUT
+    with an empty body and ``Content-Range: bytes＊/total``.
+    """
+
+    chunk_multiple = GOOGLE_CHUNK_MULTIPLE
+
+    def __init__(
+        self,
+        token_getter: TokenGetter,
+        settings: Settings | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._token = token_getter
+        self.settings = settings or get_settings()
+        self._client = client or build_client()
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def _headers(self, **extra: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {await self._token()}", **extra}
+
+    async def _json(self, method: str, path: str, **kw) -> dict:
+        response = await request_with_retry(
+            self._client,
+            method,
+            f"{API}{path}",
+            headers=await self._headers(),
+            max_retries=self.settings.max_retries,
+            **kw,
+        )
+        if not response.content:
+            return {}
+        return response.json()
+
+    # -- metadata -----------------------------------------------------------
+
+    async def get_root(self) -> RemoteItem:
+        payload = await self._json(
+            "GET",
+            "/files/root",
+            params={"fields": FILE_FIELDS, "supportsAllDrives": "true"},
+        )
+        item = _to_item(payload)
+        item.name = item.name or "My Drive"
+        return item
+
+    async def get_item(self, item_id: str) -> RemoteItem:
+        payload = await self._json(
+            "GET",
+            f"/files/{item_id}",
+            params={"fields": FILE_FIELDS, "supportsAllDrives": "true"},
+        )
+        return _to_item(payload)
+
+    async def list_children(self, folder_id: str) -> list[RemoteItem]:
+        items: list[RemoteItem] = []
+        page_token: str | None = None
+        while True:
+            params = {
+                "q": f"'{_escape_query_value(folder_id)}' in parents and trashed = false",
+                "fields": f"nextPageToken,files({FILE_FIELDS})",
+                "pageSize": "1000",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "orderBy": "folder,name",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            payload = await self._json("GET", "/files", params=params)
+            items.extend(_to_item(entry) for entry in payload.get("files", []))
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                return items
+
+    async def find_child(self, parent_id: str, name: str) -> RemoteItem | None:
+        """Look up one child by name, or ``None`` if it is not there.
+
+        Drive permits duplicates, so this can match more than one file; the
+        first is returned, which is what a conflict check wants to know about.
+        """
+        query = (
+            f"'{_escape_query_value(parent_id)}' in parents "
+            f"and name = '{_escape_query_value(name)}' and trashed = false"
+        )
+        payload = await self._json(
+            "GET",
+            "/files",
+            params={
+                "q": query,
+                "fields": f"files({FILE_FIELDS})",
+                "pageSize": "10",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+            },
+        )
+        files = payload.get("files") or []
+        return _to_item(files[0]) if files else None
+
+    async def ensure_folder(self, parent_id: str, name: str) -> RemoteItem:
+        """Return the named subfolder, creating it only if absent."""
+        existing = await self.find_child(parent_id, name)
+        if existing is not None and existing.is_folder:
+            return existing
+
+        body = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
+        payload = await self._json(
+            "POST",
+            "/files",
+            json=body,
+            params={"fields": FILE_FIELDS, "supportsAllDrives": "true"},
+        )
+        return _to_item(payload)
+
+    # -- uploads ------------------------------------------------------------
+
+    async def create_upload_session(
+        self, parent_id: str, name: str, *, size: int, conflict: str = "rename"
+    ) -> UploadSession:
+        """Open a resumable upload and return the URL Google hands back."""
+        replace_id: str | None = None
+        if conflict == "replace":
+            existing = await self.find_child(parent_id, name)
+            if existing is not None and not existing.is_folder:
+                replace_id = existing.id
+
+        headers = await self._headers(
+            **{
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Length": str(size),
+            }
+        )
+        if replace_id:
+            # Updating content keeps the file's ID, sharing and revisions.
+            url = f"{UPLOAD_API}/files/{replace_id}"
+            method = "PATCH"
+            body: dict = {"name": name}
+        else:
+            url = f"{UPLOAD_API}/files"
+            method = "POST"
+            body = {"name": name, "parents": [parent_id]}
+
+        response = await request_with_retry(
+            self._client,
+            method,
+            url,
+            params={"uploadType": "resumable", "supportsAllDrives": "true"},
+            json=body,
+            headers=headers,
+            max_retries=self.settings.max_retries,
+            follow_redirects=False,
+        )
+        location = response.headers.get("Location") or response.headers.get("location")
+        if not location:  # pragma: no cover - Google always returns one
+            raise ProviderError(f"Google returned no upload URL for {name!r}")
+        return UploadSession(url=location)
+
+    @staticmethod
+    def _offset_from_range(header: str | None) -> int:
+        """``Range: bytes=0-262143`` means 262144 bytes are in hand."""
+        if not header:
+            return 0
+        _, _, span = header.partition("=")
+        _, _, end = span.partition("-")
+        try:
+            return int(end) + 1
+        except ValueError:  # pragma: no cover - defensive
+            return 0
+
+    async def session_next_offset(self, session_url: str, total: int) -> int | None:
+        """Ask Google how much it already holds.
+
+        Returns the next byte offset it expects, or ``None`` when the session
+        is finished or gone, in which case the caller starts a new one.
+        """
+        try:
+            response = await request_with_retry(
+                self._client,
+                "PUT",
+                session_url,
+                content=b"",
+                headers=await self._headers(
+                    **{"Content-Range": f"bytes */{total}", "Content-Length": "0"}
+                ),
+                max_retries=2,
+                follow_redirects=False,
+                retry_on=frozenset({429, 500, 502, 503, 504}),
+            )
+        except NotFoundError:
+            return None
+        except ProviderError as exc:
+            # 404/410 mean the session expired; 400 can mean it was completed.
+            if exc.status in (400, 404, 410):
+                return None
+            raise
+
+        if response.status_code in (200, 201):
+            return None  # already committed
+        if response.status_code == 308:
+            return self._offset_from_range(response.headers.get("Range"))
+        return None
+
+    async def put_chunk(
+        self, session_url: str, data: bytes, offset: int, total: int
+    ) -> RemoteItem | None:
+        """Upload one chunk; returns the finished file on the last one."""
+        if not data:
+            raise ProviderError("refusing to upload an empty chunk")
+
+        end = offset + len(data) - 1
+        is_last = end == total - 1
+        if not is_last and len(data) % GOOGLE_CHUNK_MULTIPLE != 0:
+            raise ProviderError(
+                f"chunk of {len(data)} bytes is not a multiple of "
+                f"{GOOGLE_CHUNK_MULTIPLE}; Google would reject it"
+            )
+
+        response = await request_with_retry(
+            self._client,
+            "PUT",
+            session_url,
+            content=data,
+            headers=await self._headers(
+                **{
+                    "Content-Range": f"bytes {offset}-{end}/{total}",
+                    "Content-Length": str(len(data)),
+                }
+            ),
+            max_retries=self.settings.max_retries,
+            follow_redirects=False,
+        )
+
+        if response.status_code in (200, 201) and response.content:
+            return _to_item(response.json())
+        return None
+
+    async def cancel_session(self, session_url: str) -> None:
+        try:
+            await request_with_retry(
+                self._client, "DELETE", session_url, max_retries=2, follow_redirects=False
+            )
+        except ProviderError as exc:  # pragma: no cover - best effort
+            log.debug("could not cancel upload session: %s", exc)
+
+    async def simple_upload(
+        self, parent_id: str, name: str, data: bytes, *, conflict: str = "rename"
+    ) -> RemoteItem:
+        """Single-request upload, for small files and exported documents.
+
+        Drive's one-shot form is ``multipart/related``: a JSON metadata part
+        followed by the bytes. It is built by hand because the standard
+        multipart encoders all produce ``multipart/form-data`` instead.
+        """
+        replace_id: str | None = None
+        if conflict == "replace":
+            existing = await self.find_child(parent_id, name)
+            if existing is not None and not existing.is_folder:
+                replace_id = existing.id
+
+        metadata: dict = {"name": name}
+        if not replace_id:
+            metadata["parents"] = [parent_id]
+
+        boundary = f"cloudtransfer-{uuid.uuid4().hex}"
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode(),
+                b"Content-Type: application/json; charset=UTF-8\r\n\r\n",
+                json.dumps(metadata).encode("utf-8"),
+                f"\r\n--{boundary}\r\n".encode(),
+                b"Content-Type: application/octet-stream\r\n\r\n",
+                data,
+                f"\r\n--{boundary}--\r\n".encode(),
+            ]
+        )
+
+        url = f"{UPLOAD_API}/files/{replace_id}" if replace_id else f"{UPLOAD_API}/files"
+        response = await request_with_retry(
+            self._client,
+            "PATCH" if replace_id else "POST",
+            url,
+            params={
+                "uploadType": "multipart",
+                "supportsAllDrives": "true",
+                "fields": FILE_FIELDS,
+            },
+            content=body,
+            headers=await self._headers(
+                **{"Content-Type": f"multipart/related; boundary={boundary}"}
+            ),
+            max_retries=self.settings.max_retries,
+        )
+        return _to_item(response.json())
+
+    async def delete_item(self, item_id: str) -> None:
+        await self._json(
+            "DELETE", f"/files/{item_id}", params={"supportsAllDrives": "true"}
+        )
+
+    async def get_quota(self) -> tuple[int | None, int | None]:
+        """Return ``(remaining, total)`` bytes, where Drive reports them."""
+        payload = await self._json(
+            "GET", "/about", params={"fields": "storageQuota"}
+        )
+        quota = payload.get("storageQuota") or {}
+        limit = _as_int(quota.get("limit"))
+        usage = _as_int(quota.get("usage"))
+        if limit is None:
+            return None, None  # unlimited (pooled Workspace storage)
+        remaining = max(0, limit - (usage or 0))
+        return remaining, limit

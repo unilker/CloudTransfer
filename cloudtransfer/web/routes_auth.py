@@ -17,6 +17,7 @@ from ..oauth import (
     PROVIDERS,
     authorize_url,
     exchange_code,
+    google_can_write,
     new_pkce_verifier,
     new_state,
 )
@@ -197,6 +198,11 @@ async def status(request: Request) -> dict:
             "display_name": account.display_name,
             "email": account.email,
             "connected_at": account.created_at.isoformat() if account.created_at else None,
+            # Only meaningful for Google: an account connected before
+            # transfers ran both ways holds a read-only grant.
+            "can_write": (
+                google_can_write(account.scope) if provider == "google" else True
+            ),
         }
 
     return {

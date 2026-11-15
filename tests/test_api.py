@@ -13,6 +13,7 @@ from cloudtransfer.config import ONEDRIVE_CHUNK_MULTIPLE, get_settings
 from cloudtransfer.crypto import encrypt
 from cloudtransfer.db import dispose_db, session_scope
 from cloudtransfer.models import Account, Job
+from cloudtransfer.oauth import GOOGLE_WRITE_SCOPE
 
 
 @pytest.fixture
@@ -36,15 +37,29 @@ async def api(tmp_path, drive, onedrive, monkeypatch):
     from cloudtransfer.web import deps
     from cloudtransfer.web.app import create_app
 
+    # All four adapters, so either direction stays in memory.
     monkeypatch.setattr(worker_module, "GoogleDriveSource", lambda *a, **k: drive)
+    monkeypatch.setattr(worker_module, "GoogleDriveDest", lambda *a, **k: drive)
+    monkeypatch.setattr(worker_module, "OneDriveSource", lambda *a, **k: onedrive)
     monkeypatch.setattr(worker_module, "OneDriveDest", lambda *a, **k: onedrive)
     monkeypatch.setattr(
         worker_module, "TokenManager", lambda *a, **k: SimpleNamespace(get_token=token)
     )
     worker_module._runner = None
 
+    from cloudtransfer.web import routes_jobs
+
+    monkeypatch.setattr(
+        routes_jobs,
+        "build_providers",
+        lambda direction, settings, client: worker_module.build_providers(
+            direction, settings, client
+        ),
+    )
+
     app = create_app()
     app.dependency_overrides[deps.drive_source] = lambda: drive
+    app.dependency_overrides[deps.drive_dest] = lambda: drive
     app.dependency_overrides[deps.onedrive_dest] = lambda: onedrive
 
     async with app.router.lifespan_context(app):
@@ -53,9 +68,9 @@ async def api(tmp_path, drive, onedrive, monkeypatch):
         settings = get_settings()
         secret = settings.resolve_secret_key()
         async with session_scope(settings) as session:
-            for provider, email in (
-                ("google", "tester@example.com"),
-                ("microsoft", "tester@contoso.example"),
+            for provider, email, scope in (
+                ("google", "tester@example.com", f"{GOOGLE_WRITE_SCOPE} openid email"),
+                ("microsoft", "tester@contoso.example", "offline_access Files.ReadWrite"),
             ):
                 session.add(
                     Account(
@@ -65,7 +80,9 @@ async def api(tmp_path, drive, onedrive, monkeypatch):
                         access_token_enc=encrypt(secret, "access-token"),
                         refresh_token_enc=encrypt(secret, "refresh-token"),
                         expires_at=time.time() + 3600,
-                        scope="",
+                        # A real connection records what was granted; the
+                        # reverse direction is refused without write access.
+                        scope=scope,
                     )
                 )
 
@@ -134,7 +151,9 @@ async def test_authorize_redirect_carries_the_right_scopes(api):
     assert response.status_code == 307
     location = response.headers["location"]
     assert "accounts.google.com" in location
-    assert "drive.readonly" in location
+    # Full Drive access, since files travel both ways.
+    assert "auth%2Fdrive+openid" in location
+    assert "drive.readonly" not in location
     # Without these, Google issues no refresh token and the app dies in an hour.
     assert "access_type=offline" in location
     assert "prompt=consent" in location
@@ -522,3 +541,89 @@ async def test_an_explicit_base_url_wins_over_the_request(api, monkeypatch):
     assert payload["providers"]["google"]["redirect_uri"] == (
         "https://transfer.example.com/auth/google/callback"
     )
+
+
+# -------------------------------------------------------- direction guards
+
+
+async def test_a_reverse_job_is_refused_on_a_read_only_google_grant(api):
+    """No refresh widens a scope, so this has to be caught before any upload."""
+    from sqlalchemy import select
+
+    from cloudtransfer.db import session_scope
+    from cloudtransfer.models import Account
+    from cloudtransfer.oauth import GOOGLE_READONLY_SCOPE
+
+    async with session_scope(get_settings()) as session:
+        account = (
+            await session.execute(select(Account).where(Account.provider == "google"))
+        ).scalar_one()
+        account.scope = f"{GOOGLE_READONLY_SCOPE} openid email"
+
+    response = await api.post(
+        "/api/jobs",
+        json={
+            "direction": "onedrive_to_gdrive",
+            "source_folder_id": "root",
+            "dest_folder_id": "root",
+        },
+    )
+    assert response.status_code == 409
+    assert "read-only" in response.json()["detail"]
+    assert "connect it again" in response.json()["detail"]
+
+
+async def test_the_forward_direction_still_works_on_a_read_only_grant(api, drive, onedrive):
+    """Sending files to OneDrive never needed write access to Drive."""
+    from sqlalchemy import select
+
+    from cloudtransfer.db import session_scope
+    from cloudtransfer.models import Account
+    from cloudtransfer.oauth import GOOGLE_READONLY_SCOPE
+
+    async with session_scope(get_settings()) as session:
+        account = (
+            await session.execute(select(Account).where(Account.provider == "google"))
+        ).scalar_one()
+        account.scope = f"{GOOGLE_READONLY_SCOPE} openid email"
+
+    drive.add_file("a.txt", b"hello")
+    response = await api.post(
+        "/api/jobs",
+        json={
+            "direction": "gdrive_to_onedrive",
+            "source_folder_id": "root",
+            "dest_folder_id": onedrive.root.id,
+            "start_immediately": True,
+        },
+    )
+    assert response.status_code == 200
+    final = await _await_job(api, response.json()["id"])
+    assert final["status"] == "completed"
+
+
+async def test_status_reports_whether_drive_can_be_written(api):
+    payload = (await api.get("/api/status")).json()
+    assert payload["google"]["can_write"] is True
+    # Microsoft is always read/write; the flag is there for a uniform shape.
+    assert payload["microsoft"]["can_write"] is True
+
+
+async def test_a_reverse_job_records_its_direction(api, drive, onedrive):
+    onedrive.add_file("from-onedrive.txt", b"payload")
+    created = await api.post(
+        "/api/jobs",
+        json={
+            "direction": "onedrive_to_gdrive",
+            "source_folder_id": "root",
+            "dest_folder_id": drive.root.id,
+            "start_immediately": True,
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["direction"] == "onedrive_to_gdrive"
+    assert created.json()["direction_label"] == "OneDrive to Google Drive"
+
+    final = await _await_job(api, created.json()["id"])
+    assert final["status"] == "completed"
+    assert drive.tree() == {"from-onedrive.txt": b"payload"}

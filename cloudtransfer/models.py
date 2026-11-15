@@ -59,6 +59,26 @@ class TaskStatus:
     SKIPPED = "skipped"
 
 
+class Direction:
+    """Which way a job moves files."""
+
+    GDRIVE_TO_ONEDRIVE = "gdrive_to_onedrive"
+    ONEDRIVE_TO_GDRIVE = "onedrive_to_gdrive"
+
+    ALL = (GDRIVE_TO_ONEDRIVE, ONEDRIVE_TO_GDRIVE)
+
+    LABELS = {
+        GDRIVE_TO_ONEDRIVE: "Google Drive to OneDrive",
+        ONEDRIVE_TO_GDRIVE: "OneDrive to Google Drive",
+    }
+
+    #: provider key of each side, for picking adapters and naming policies
+    SIDES = {
+        GDRIVE_TO_ONEDRIVE: ("gdrive", "onedrive"),
+        ONEDRIVE_TO_GDRIVE: ("onedrive", "gdrive"),
+    }
+
+
 class ConflictPolicy:
     """What to do when the destination already holds a file of the same name."""
 
@@ -134,6 +154,9 @@ class Job(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING, index=True)
+    direction: Mapped[str] = mapped_column(
+        String(32), default=Direction.GDRIVE_TO_ONEDRIVE, nullable=False
+    )
 
     source_folder_id: Mapped[str] = mapped_column(String(256), nullable=False)
     source_folder_name: Mapped[str] = mapped_column(String(512), default="")
@@ -166,6 +189,10 @@ class Job(Base):
     @property
     def is_active(self) -> bool:
         return self.status in JobStatus.ACTIVE
+
+    @property
+    def direction_label(self) -> str:
+        return Direction.LABELS.get(self.direction, self.direction)
 
     @property
     def percent(self) -> float:
