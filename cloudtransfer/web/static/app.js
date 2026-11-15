@@ -123,6 +123,9 @@ class Picker {
     this.stack = [];
     this.selected = null;
     this.ready = false;
+    // Items ticked in the folder currently on screen. Empty means the whole
+    // folder, which is what most transfers want.
+    this.picks = new Set();
 
     this.listing = $('[data-role="listing"]', this.root);
     this.crumbs = $('[data-role="crumbs"]', this.root);
@@ -145,7 +148,13 @@ class Picker {
       this.role === 'source' ? 'picker.from' : 'picker.to',
       { provider: this.provider.name }
     );
-    if (this.selected) {
+    if (this.selected && this.picks.size) {
+      this.pickedBox.classList.add('set');
+      this.pickedBox.innerHTML = t('picker.selectedItems', {
+        path: `<strong>${escapeHtml(this.selected.path)}</strong>`,
+        n: this.picks.size,
+      });
+    } else if (this.selected) {
       this.pickedBox.innerHTML = t('picker.selected', {
         path: `<strong>${escapeHtml(this.selected.path)}</strong>`,
       });
@@ -168,6 +177,7 @@ class Picker {
     this.stack = [{ id: 'root', name: next.rootLabel }];
     this.selected = null;
     this.ready = false;
+    this.picks.clear();
 
     if (this.newFolderButton) {
       // Only the destination needs new folders, and only where we can make them.
@@ -191,6 +201,8 @@ class Picker {
   }
 
   async load() {
+    // Ticks belong to the folder on screen; moving changes what they meant.
+    this.picks.clear();
     this.listing.innerHTML = `<li class="loading">${escapeHtml(t('picker.loading'))}</li>`;
     this.renderCrumbs();
     try {
@@ -207,10 +219,17 @@ class Picker {
   }
 
   renderListing(data) {
+    // Only the source side is ticked; the destination is a single folder.
+    const pickable = this.role === 'source';
+    const box = (id) => pickable
+      ? `<input type="checkbox" class="pick" data-id="${escapeHtml(id)}">`
+      : '';
+
     const rows = [];
     for (const folder of data.folders) {
       rows.push(
         `<li class="folder" data-id="${escapeHtml(folder.id)}" data-name="${escapeHtml(folder.name)}">` +
+        box(folder.id) +
         `<span class="icon">\u{1F4C1}</span>` +
         `<span class="label">${escapeHtml(folder.name)}</span>` +
         `</li>`
@@ -223,7 +242,8 @@ class Picker {
             ? `<span class="tag">${escapeHtml(t('picker.shortcut'))}</span>`
             : '');
       rows.push(
-        `<li class="file">` +
+        `<li class="file${pickable ? ' pickable' : ''}">` +
+        box(file.id) +
         `<span class="icon">\u{1F4C4}</span>` +
         `<span class="label">${escapeHtml(file.name)}</span>` +
         `${tag}<span class="size">${file.size === null ? '' : bytes(file.size)}</span>` +
@@ -239,6 +259,17 @@ class Picker {
       row.addEventListener('click', () => {
         this.stack.push({ id: row.dataset.id, name: row.dataset.name });
         this.load();
+      });
+    });
+
+    $$('input.pick', this.listing).forEach((box) => {
+      // Ticking a folder must not also open it.
+      box.addEventListener('click', (event) => event.stopPropagation());
+      box.addEventListener('change', () => {
+        if (box.checked) this.picks.add(box.dataset.id);
+        else this.picks.delete(box.dataset.id);
+        this.relabel();
+        refreshStartButton();
       });
     });
   }
@@ -618,10 +649,14 @@ function refreshStartButton() {
     hint.textContent = t('start.hint', { reasons: reasons.join(', ') });
   } else {
     button.disabled = false;
-    hint.textContent = t('start.ready', {
-      source: sourcePicker.selected.path,
-      dest: destPicker.selected.path,
-    });
+    hint.textContent = t(
+      sourcePicker.picks.size ? 'start.readySelected' : 'start.ready',
+      {
+        source: sourcePicker.selected.path,
+        dest: destPicker.selected.path,
+        n: sourcePicker.picks.size,
+      }
+    );
   }
 }
 
@@ -633,6 +668,7 @@ $('#start').addEventListener('click', async () => {
       method: 'POST',
       body: JSON.stringify({
         direction,
+        selection: Array.from(sourcePicker.picks),
         source_folder_id: sourcePicker.selected.id,
         source_folder_name: sourcePicker.selected.path,
         dest_folder_id: destPicker.selected.id,
@@ -659,7 +695,10 @@ const expanded = new Set();
 const taskCache = new Map();
 
 function statusLabel(status) {
-  return status.replace(/_/g, ' ');
+  // Falls back to the raw value, so a status added server-side still shows
+  // something sensible before it gets a translation.
+  const translated = t(`status.${status}`);
+  return translated === `status.${status}` ? status.replace(/_/g, ' ') : translated;
 }
 
 function jobCard(job) {
@@ -708,17 +747,20 @@ function jobCard(job) {
       `<a class="btn btn-small" href="/api/jobs/${job.id}/report?fmt=csv">${escapeHtml(t('job.report'))}</a>`
     );
   }
-  if (!job.running) {
-    actions.push(`<button class="btn btn-small btn-quiet" data-act="delete">${escapeHtml(t('job.delete'))}</button>`);
-  }
+  // Delete is always offered: refusing it while running leaves someone stuck
+  // precisely when stopping is what they wanted.
+  actions.push(`<button class="btn btn-small btn-quiet" data-act="delete">${escapeHtml(t('job.delete'))}</button>`);
 
   return `
-    <div class="job ${doneish ? 'done' : ''}" data-job="${job.id}">
+    <div class="job ${doneish ? 'done' : ''}" data-job="${job.id}"
+         data-running="${job.running ? 'true' : 'false'}">
       <div class="job-top">
         <div class="job-route">
           #${job.id} ${escapeHtml(job.source_folder_name || job.source_folder_id)}
           <span class="arrow">→</span>${escapeHtml(job.dest_folder_path || '')}
-          <span class="job-direction">${escapeHtml(job.direction_label || '')}</span>
+          <span class="job-direction">${escapeHtml(
+            job.direction ? t(`direction.${job.direction}`) : ''
+          )}</span>
         </div>
         <span class="job-status s-${job.status}">${escapeHtml(statusLabel(job.status))}</span>
       </div>
@@ -779,6 +821,13 @@ function wireJobCard(card) {
   $$('[data-act]', card).forEach((button) => {
     button.addEventListener('click', async () => {
       const act = button.dataset.act;
+      const original = button.textContent;
+      if (act === 'pause' || act === 'cancel' || act === 'delete') {
+        // Stopping happens between chunks, so there is a visible wait. Say so
+        // rather than letting the button look unresponsive.
+        button.disabled = true;
+        button.textContent = t('job.stopping');
+      }
       try {
         if (act === 'toggle') {
           const box = $('[data-role="files"]', card);
@@ -794,7 +843,10 @@ function wireJobCard(card) {
           return;
         }
         if (act === 'delete') {
-          if (!confirm(t('job.confirmDelete', { id: jobId }))) return;
+          const key = card.dataset.running === 'true'
+            ? 'job.confirmDeleteRunning'
+            : 'job.confirmDelete';
+          if (!confirm(t(key, { id: jobId }))) return;
           await api(`/api/jobs/${jobId}`, { method: 'DELETE' });
           expanded.delete(jobId);
         } else if (act === 'retry') {
@@ -805,6 +857,8 @@ function wireJobCard(card) {
         }
         await refreshJobs();
       } catch (error) {
+        button.disabled = false;
+        button.textContent = original;
         banner.show(error.message, 'error', false);
       }
     });

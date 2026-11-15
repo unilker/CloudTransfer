@@ -29,7 +29,7 @@ from ..models import ConflictPolicy, Direction, FileTask, Job, JobStatus, TaskSt
 from ..naming import join_path
 from ..providers.gdrive import GoogleDriveDest, GoogleDriveSource
 from ..providers.onedrive import OneDriveDest, OneDriveSource
-from .planner import plan_job
+from .planner import PlanningInterrupted, plan_job
 from .transfer import FileTransfer
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,44 @@ PROGRESS_FLUSH_SECONDS = 1.0
 
 class JobStopped(CloudTransferError):
     """Raised inside the relay to unwind a paused or cancelled job."""
+
+
+async def _recount(session, job_id: int) -> None:
+    """Refresh a job's totals from its file tasks.
+
+    Called whenever a task settles and again when the run ends, so a paused
+    job's figures are current rather than frozen at the last completed file.
+    """
+    job = await session.get(Job, job_id)
+    if job is None:  # pragma: no cover - deleted mid-flight
+        return
+
+    counts = dict(
+        (
+            await session.execute(
+                select(FileTask.status, func.count())
+                .where(FileTask.job_id == job_id)
+                .group_by(FileTask.status)
+            )
+        ).all()
+    )
+    # Every byte the destination holds, not only those in finished files. A
+    # paused job would otherwise report nothing moved, when in fact the
+    # destination is keeping the partial uploads and a resume continues from
+    # them.
+    moved = (
+        await session.execute(
+            select(func.coalesce(func.sum(FileTask.bytes_done), 0)).where(
+                FileTask.job_id == job_id,
+                FileTask.status != TaskStatus.SKIPPED,
+            )
+        )
+    ).scalar_one()
+
+    job.done_files = counts.get(TaskStatus.DONE, 0)
+    job.failed_files = counts.get(TaskStatus.FAILED, 0)
+    job.skipped_files = counts.get(TaskStatus.SKIPPED, 0)
+    job.done_bytes = int(moved or 0)
 
 
 def build_providers(direction: str, settings: Settings, client):
@@ -187,7 +225,16 @@ class JobRunner:
                 ).scalar_one()
 
             if pending_count == 0:
-                await plan_job(job_id, source, self.settings)
+                try:
+                    await plan_job(
+                        job_id, source, self.settings, should_stop=stop.is_set
+                    )
+                except PlanningInterrupted as exc:
+                    log.info("job %d: counting was stopped (%s)", job_id, exc)
+                    await self._finalize(job_id, stop, interrupted=True)
+                    await source.close()
+                    await dest.close()
+                    return
 
             async with session_scope(self.settings) as session:
                 job = await session.get(Job, job_id)
@@ -404,11 +451,16 @@ class JobRunner:
                 )
 
             except JobStopped:
-                # Leave the task pending with its session URL stored.
+                # Leave the task pending with its session URL stored, and save
+                # the progress the throttled callback may not have flushed yet.
+                reached = live.files.get(task_id)
                 async with session_scope(self.settings) as session:
                     row = await session.get(FileTask, task_id)
                     if row is not None:
                         row.status = TaskStatus.PENDING
+                        if reached is not None:
+                            row.bytes_done = reached[1]
+                    await _recount(session, job_id)
                 live.files.pop(task_id, None)
                 log.info("paused during %s; it will resume from where it stopped", label)
 
@@ -462,36 +514,24 @@ class JobRunner:
                 task.upload_url = None
                 task.upload_expires_at = None
 
-            job = await session.get(Job, job_id)
-            if job is None:  # pragma: no cover
-                return
-            counts = dict(
-                (
-                    await session.execute(
-                        select(FileTask.status, func.count())
-                        .where(FileTask.job_id == job_id)
-                        .group_by(FileTask.status)
-                    )
-                ).all()
-            )
-            moved = (
-                await session.execute(
-                    select(func.coalesce(func.sum(FileTask.bytes_done), 0)).where(
-                        FileTask.job_id == job_id, FileTask.status == TaskStatus.DONE
-                    )
-                )
-            ).scalar_one()
-            job.done_files = counts.get(TaskStatus.DONE, 0)
-            job.failed_files = counts.get(TaskStatus.FAILED, 0)
-            job.skipped_files = counts.get(TaskStatus.SKIPPED, 0)
-            job.done_bytes = int(moved or 0)
+            await _recount(session, job_id)
 
-    async def _finalize(self, job_id: int, stop: asyncio.Event) -> None:
+    async def _finalize(
+        self, job_id: int, stop: asyncio.Event, *, interrupted: bool = False
+    ) -> None:
+        """Settle the job's final status.
+
+        ``interrupted`` means the run was stopped before it had a plan to work
+        from, so there is no outstanding work to infer a paused state from -
+        and without it a job stopped while counting would be filed as finished
+        having transferred nothing.
+        """
         cancelled = job_id in self._cancelling
         async with session_scope(self.settings) as session:
             job = await session.get(Job, job_id)
             if job is None:  # pragma: no cover
                 return
+            await _recount(session, job_id)
             remaining = (
                 await session.execute(
                     select(func.count())
@@ -506,7 +546,7 @@ class JobRunner:
             if cancelled:
                 job.status = JobStatus.CANCELLED
                 job.finished_at = func.now()
-            elif stop.is_set() and remaining:
+            elif interrupted or (stop.is_set() and remaining):
                 job.status = JobStatus.PAUSED
             elif remaining:  # pragma: no cover - loop exits when none remain
                 job.status = JobStatus.PAUSED

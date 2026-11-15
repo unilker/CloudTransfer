@@ -46,6 +46,17 @@ If the goal is "nothing touches my computer", deploy it (see
 
 ## What it handles
 
+**Picking what moves.** Tick individual files and folders in the source list,
+or tick nothing and the whole folder moves. A ticked folder is taken whole.
+The choice applies to the folder on screen, so navigating elsewhere starts a
+fresh selection.
+
+**Stopping.** Pause, cancel and delete act between chunks, and also during the
+counting pass - a large folder is many requests, and waiting for all of them
+before acknowledging a pause makes the button look broken. Deleting a running
+transfer stops it first rather than refusing. A paused job reports the bytes
+the destination is already holding, not only those in finished files.
+
 **Resume.** OneDrive is authoritative about how many bytes it holds. After a
 pause, a crash, a dropped connection or a restarted process, each file
 continues from exactly that byte — the upload session URL is stored in the
@@ -353,7 +364,7 @@ a second, independently written implementation.
 | Port selection, console-less launch | `tests/test_desktop.py` |
 | Drive adapter over mocked HTTP | `tests/test_gdrive.py` |
 | OneDrive upload protocol | `tests/test_onedrive.py` |
-| Tree walking and name resolution | `tests/test_planner.py` |
+| Tree walking, name resolution, selections | `tests/test_planner.py` |
 | Job lifecycle, pause/resume | `tests/test_worker.py` |
 | REST surface | `tests/test_api.py` |
 

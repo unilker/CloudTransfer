@@ -165,6 +165,10 @@ class Job(Base):
     dest_folder_id: Mapped[str] = mapped_column(String(256), nullable=False)
     dest_folder_path: Mapped[str] = mapped_column(Text, default="")
 
+    # Specific items inside the source folder to move. Empty or absent means
+    # the whole folder, which is what most transfers want.
+    selection: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
     conflict_policy: Mapped[str] = mapped_column(String(16), default=ConflictPolicy.RENAME)
     verify: Mapped[bool] = mapped_column(Boolean, default=True)
     include_trashed: Mapped[bool] = mapped_column(Boolean, default=False)

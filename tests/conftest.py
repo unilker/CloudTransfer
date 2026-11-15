@@ -117,6 +117,8 @@ class FakeCloud:
         self.fail_permanently: set[str] = set()
         self.range_supported = True
         self.chunk_delay = 0.0
+        # Listing delay, to stand in for walking a large tree over the network.
+        self.list_delay = 0.0
         self.quota_remaining: int | None = 10 * 1024**4
 
     # -- construction ------------------------------------------------------
@@ -198,6 +200,8 @@ class FakeCloud:
     async def list_children(
         self, folder_id: str, *, include_trashed: bool = False
     ) -> list[RemoteItem]:
+        if self.list_delay:
+            await asyncio.sleep(self.list_delay)
         return [
             self._to_item(n)
             for n in self._children(folder_id)

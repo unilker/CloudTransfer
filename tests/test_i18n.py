@@ -110,6 +110,11 @@ def test_nothing_is_defined_but_never_used(keys):
     # a ternary inside t(), which no argument pattern would see.
     used = {key for key in keys["en"] if f"'{key}'" in APP_JS}
     used |= set(re.findall(r'data-i18n(?:-html)?="([^"]+)"', INDEX_HTML))
+
+    # Some keys are built at runtime, as t(`status.${job.status}`). Treat every
+    # key under such a prefix as used, since the whole family is reachable.
+    for prefix in re.findall(r"t\(`([a-z][a-zA-Z.]*\.)\$\{", APP_JS):
+        used |= {key for key in keys["en"] if key.startswith(prefix)}
     for pair in re.findall(r'data-i18n-attr="([^"]+)"', INDEX_HTML):
         for entry in pair.split(","):
             _, _, key = entry.partition(":")
@@ -179,3 +184,25 @@ def test_every_key_is_namespaced(keys):
     for language in LANGUAGES:
         flat = {key for key in keys[language] if "." not in key}
         assert not flat, f"{language} has un-namespaced keys: {sorted(flat)}"
+
+
+def test_every_job_status_has_a_translation(keys):
+    """Statuses are looked up by a key built at runtime, so a missing one shows
+    the raw value from the database instead of a sentence."""
+    from cloudtransfer.models import JobStatus
+
+    statuses = {
+        value for name, value in vars(JobStatus).items()
+        if not name.startswith("_") and isinstance(value, str)
+    }
+    for language in LANGUAGES:
+        missing = {s for s in statuses if f"status.{s}" not in keys[language]}
+        assert not missing, f"{language} has no label for: {sorted(missing)}"
+
+
+def test_every_direction_has_a_translation(keys):
+    from cloudtransfer.models import Direction
+
+    for language in LANGUAGES:
+        missing = {d for d in Direction.ALL if f"direction.{d}" not in keys[language]}
+        assert not missing, f"{language} has no label for: {sorted(missing)}"

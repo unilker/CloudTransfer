@@ -627,3 +627,101 @@ async def test_a_reverse_job_records_its_direction(api, drive, onedrive):
     final = await _await_job(api, created.json()["id"])
     assert final["status"] == "completed"
     assert drive.tree() == {"from-onedrive.txt": b"payload"}
+
+
+# ---------------------------------------------------------- ticked transfers
+
+
+async def test_only_ticked_items_are_transferred(api, drive, onedrive):
+    folder = drive.add_folder("Wanted")
+    drive.add_file("inside.txt", b"inside", parent=folder.id)
+    loose = drive.add_file("loose.txt", b"loose")
+    drive.add_file("untouched.txt", b"untouched")
+    drive.add_folder("Untouched folder")
+
+    created = await api.post(
+        "/api/jobs",
+        json={
+            "source_folder_id": "root",
+            "dest_folder_id": onedrive.root.id,
+            "selection": [folder.id, loose.id],
+            "start_immediately": True,
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["selection_count"] == 2
+
+    final = await _await_job(api, created.json()["id"])
+    assert final["status"] == "completed"
+    assert onedrive.tree() == {
+        "Wanted/inside.txt": b"inside",
+        "loose.txt": b"loose",
+    }
+
+
+async def test_no_selection_still_moves_everything(api, drive, onedrive):
+    drive.add_file("a.txt", b"a")
+    drive.add_file("b.txt", b"b")
+
+    created = await api.post(
+        "/api/jobs",
+        json={
+            "source_folder_id": "root",
+            "dest_folder_id": onedrive.root.id,
+            "start_immediately": True,
+        },
+    )
+    assert created.json()["selection_count"] == 0
+    await _await_job(api, created.json()["id"])
+    assert set(onedrive.tree()) == {"a.txt", "b.txt"}
+
+
+# ------------------------------------------------------------ stop and delete
+
+
+async def test_a_running_transfer_can_be_deleted(api, drive, onedrive, payload_factory):
+    """Refusing this left people stuck exactly when stopping was the point."""
+    for i in range(6):
+        drive.add_file(f"big{i}.bin", payload_factory(1_310_720 * 2))
+    onedrive.chunk_delay = 0.02
+
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+
+    for _ in range(600):
+        if (await api.get(f"/api/jobs/{job_id}")).json()["running"]:
+            break
+        await asyncio.sleep(0.01)
+
+    response = await api.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["stopped"] is True
+    assert (await api.get(f"/api/jobs/{job_id}")).status_code == 404
+
+
+async def test_deleting_a_finished_transfer_reports_it_was_not_running(
+    api, drive, onedrive
+):
+    drive.add_file("a.txt", b"a")
+    job_id = (
+        await api.post(
+            "/api/jobs",
+            json={
+                "source_folder_id": "root",
+                "dest_folder_id": onedrive.root.id,
+                "start_immediately": True,
+            },
+        )
+    ).json()["id"]
+    await _await_job(api, job_id)
+
+    response = await api.delete(f"/api/jobs/{job_id}")
+    assert response.json() == {"deleted": job_id, "stopped": False}

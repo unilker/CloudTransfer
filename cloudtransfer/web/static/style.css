@@ -620,3 +620,28 @@ code {
 .import-label { font-size: 13px; font-weight: 600; }
 .import-button { cursor: pointer; margin: 0; }
 .import-row .field-hint { flex-basis: 100%; }
+
+/* -- ticking individual items ------------------------------------------- */
+
+.listing input.pick {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* A file is normally inert; with a tick box it becomes interactive. */
+.listing li.file.pickable { color: var(--text); }
+.listing li.file.pickable:hover { background: var(--surface-2); }
+
+.select-hint {
+  margin: 0;
+  padding: 7px 12px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}

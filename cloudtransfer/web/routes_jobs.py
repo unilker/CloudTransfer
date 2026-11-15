@@ -30,6 +30,9 @@ router = APIRouter(prefix="/api/jobs")
 
 SSE_POLL_SECONDS = 1.0
 
+# How long a delete waits for a running transfer to settle.
+STOP_WAIT_SECONDS = 20.0
+
 
 class JobCreate(BaseModel):
     direction: Literal["gdrive_to_onedrive", "onedrive_to_gdrive"] = (
@@ -37,6 +40,8 @@ class JobCreate(BaseModel):
     )
     source_folder_id: str = Field(..., min_length=1)
     source_folder_name: str = ""
+    # Items inside the source folder to move. Empty means the whole folder.
+    selection: list[str] = Field(default_factory=list, max_length=5000)
     dest_folder_id: str = Field(..., min_length=1)
     dest_folder_path: str = ""
     conflict_policy: Literal["rename", "replace", "skip"] = ConflictPolicy.RENAME
@@ -53,6 +58,7 @@ def _job_dict(job: Job) -> dict:
         "direction_label": job.direction_label,
         "source_folder_id": job.source_folder_id,
         "source_folder_name": job.source_folder_name,
+        "selection_count": len(job.selection or []),
         "dest_folder_id": job.dest_folder_id,
         "dest_folder_path": job.dest_folder_path,
         "conflict_policy": job.conflict_policy,
@@ -165,6 +171,7 @@ async def create_job(body: JobCreate) -> dict:
             direction=body.direction,
             source_folder_id=body.source_folder_id,
             source_folder_name=body.source_folder_name,
+            selection=body.selection or None,
             dest_folder_id=dest_id,
             dest_folder_path=dest_path,
             conflict_policy=body.conflict_policy,
@@ -181,8 +188,12 @@ async def create_job(body: JobCreate) -> dict:
         payload["status"] = JobStatus.PENDING
 
     log.info(
-        "created job %d (%s): %s -> %s",
-        job_id, body.direction, body.source_folder_name, dest_path,
+        "created job %d (%s): %s (%s) -> %s",
+        job_id,
+        body.direction,
+        body.source_folder_name,
+        f"{len(body.selection)} selected items" if body.selection else "whole folder",
+        dest_path,
     )
     return payload
 
@@ -304,19 +315,40 @@ async def retry_failed(job_id: int) -> dict:
 
 @router.delete("/{job_id}")
 async def delete_job(job_id: int) -> dict:
+    """Remove a transfer, stopping it first if it is still running.
+
+    Refusing to delete a running job leaves the user stuck whenever stopping
+    is what they wanted in the first place, so this cancels and waits instead.
+    Files already transferred are not touched.
+    """
     runner = get_runner()
+    async with session_scope() as session:
+        if await session.get(Job, job_id) is None:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    stopped = False
     if runner.is_running(job_id):
-        raise HTTPException(
-            status_code=409, detail="Stop the job before deleting it"
-        )
+        await runner.cancel(job_id)
+        stopped = True
+        deadline = asyncio.get_running_loop().time() + STOP_WAIT_SECONDS
+        while runner.is_running(job_id):
+            if asyncio.get_running_loop().time() > deadline:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The transfer was asked to stop but has not finished the "
+                        "chunk it is on. Try again in a moment."
+                    ),
+                )
+            await asyncio.sleep(0.1)
+
     async with session_scope() as session:
         job = await session.get(Job, job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-        # The relationship cascades and the foreign key is ON DELETE CASCADE,
-        # so deleting the job takes its file tasks with it.
-        await session.delete(job)
-    return {"deleted": job_id}
+        if job is not None:
+            # The relationship cascades and the foreign key is ON DELETE
+            # CASCADE, so deleting the job takes its file tasks with it.
+            await session.delete(job)
+    return {"deleted": job_id, "stopped": stopped}
 
 
 @router.get("/{job_id}/events")

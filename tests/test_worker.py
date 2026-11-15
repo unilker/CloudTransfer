@@ -382,3 +382,109 @@ async def test_empty_job_completes_immediately(db, onedrive, runner, job_factory
     job = await _job(db, job_id)
     assert job.status == JobStatus.COMPLETED
     assert job.total_files == 0
+
+
+# ------------------------------------------------- stopping while it counts
+
+
+def _deep_tree(drive, depth: int = 12):
+    """A tree whose counting takes many round trips, as a real folder does."""
+    parent = "root"
+    for level in range(depth):
+        folder = drive.add_folder(f"level{level}", parent=parent)
+        drive.add_file(f"file{level}.txt", b"x" * 10, parent=folder.id)
+        parent = folder.id
+
+
+async def test_pausing_while_counting_stops_promptly(
+    db, drive, onedrive, runner, job_factory
+):
+    """Counting a large folder is many requests. Waiting for all of them before
+    acknowledging a pause makes the button look broken."""
+    _deep_tree(drive)
+    drive.list_delay = 0.25
+
+    job_id = await job_factory("root", onedrive.root.id)
+    await runner.start(job_id)
+    await asyncio.sleep(0.6)
+
+    assert await runner.pause(job_id) is True
+    started = asyncio.get_running_loop().time()
+    await _finish(runner, job_id)
+    took = asyncio.get_running_loop().time() - started
+
+    assert took < 1.5, f"pause took {took:.1f}s; the walk ignored the stop signal"
+    job = await _job(db, job_id)
+    # Nothing was transferred, so this is paused work, not finished work.
+    assert job.status == JobStatus.PAUSED
+
+
+async def test_cancelling_while_counting_stops_promptly(
+    db, drive, onedrive, runner, job_factory
+):
+    _deep_tree(drive)
+    drive.list_delay = 0.25
+
+    job_id = await job_factory("root", onedrive.root.id)
+    await runner.start(job_id)
+    await asyncio.sleep(0.6)
+
+    await runner.cancel(job_id)
+    started = asyncio.get_running_loop().time()
+    await _finish(runner, job_id)
+    assert asyncio.get_running_loop().time() - started < 1.5
+
+    assert (await _job(db, job_id)).status == JobStatus.CANCELLED
+
+
+async def test_a_half_counted_tree_is_not_saved_as_the_plan(
+    db, drive, onedrive, runner, job_factory
+):
+    """A partial plan would look complete and move only some of the files."""
+    _deep_tree(drive)
+    drive.list_delay = 0.25
+
+    job_id = await job_factory("root", onedrive.root.id)
+    await runner.start(job_id)
+    await asyncio.sleep(0.6)
+    await runner.pause(job_id)
+    await _finish(runner, job_id)
+
+    assert await _tasks(db, job_id) == []
+    assert (await _job(db, job_id)).total_files == 0
+
+    # Resuming counts again from the start and moves everything.
+    drive.list_delay = 0.0
+    await runner.start(job_id)
+    await _finish(runner, job_id)
+
+    job = await _job(db, job_id)
+    assert job.status == JobStatus.COMPLETED
+    assert job.done_files == 12
+    assert len(onedrive.tree()) == 12
+
+
+async def test_a_paused_job_reports_the_bytes_already_uploaded(
+    db, drive, onedrive, runner, job_factory, payload_factory, settings
+):
+    """Reporting zero after a pause suggests nothing happened, when the
+    destination is in fact holding the partial uploads for the resume."""
+    drive.add_file("one.bin", payload_factory(settings.chunk_size * 4))
+    onedrive.chunk_delay = 0.02
+
+    job_id = await job_factory("root", onedrive.root.id)
+    await runner.start(job_id)
+
+    for _ in range(600):
+        live = runner.progress(job_id)
+        if live and live.bytes_now > settings.chunk_size:
+            break
+        await asyncio.sleep(0.01)
+    await runner.pause(job_id)
+    await _finish(runner, job_id)
+
+    job = await _job(db, job_id)
+    assert job.status == JobStatus.PAUSED
+    assert job.done_files == 0          # no file finished
+    assert job.done_bytes > 0           # but bytes did move
+    assert job.done_bytes < job.total_bytes

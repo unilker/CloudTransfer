@@ -120,7 +120,15 @@ karşınıza çıkmaz.
 1. 2. adımda iki hesabı da **Connect** ile bağlayın.
 2. 3. adımda önce **yönü** seçin (ya da **Swap** ile ters çevirin).
 3. Soldan kaynak klasörü, sağdan hedef klasörü seçin.
-4. Aynı isim varsa ne olacağını seçip **Start transfer** deyin.
+4. **Yalnızca belirli dosya veya klasörleri** aktarmak istiyorsanız soldaki
+   listede onları işaretleyin. Bir klasörü işaretlemek o klasörün tamamını
+   seçer. Hiçbir şey işaretlemezseniz klasörün tümü aktarılır.
+5. Aynı isim varsa ne olacağını seçip **Aktarımı başlat** deyin.
+
+Aktarım listesindeki her işi **Duraklat**, **İptal et** ve **Sil**
+düğmeleriyle yönetebilirsiniz. Duraklatma dosyaların ortasında da çalışır;
+devam ettiğinizde kaldığı baytdan sürer. Silme, iş hâlâ sürüyorsa önce
+durdurur. Aktarılmış dosyalar her durumda hedefte kalır.
 
 Aktarım sırasında duraklatabilirsiniz; kaldığı **baytdan** devam eder. Bittiğinde
 **Download report** ile her dosyanın durumunu, yeniden adlandırmaları ve atlanan

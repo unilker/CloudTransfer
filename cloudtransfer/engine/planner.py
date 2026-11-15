@@ -18,6 +18,7 @@ export extension already applied, before anything is written down.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from sqlalchemy import delete, select
 
@@ -41,6 +42,16 @@ log = logging.getLogger(__name__)
 BATCH_SIZE = 200
 
 
+class PlanningInterrupted(Exception):
+    """The walk was stopped before it finished.
+
+    Counting a large tree is many round trips, and a user who presses pause
+    should not have to wait for all of them. Nothing is written when this is
+    raised: a partial plan would look complete and quietly transfer only some
+    of the files, so a resume re-counts from the start instead.
+    """
+
+
 class PlannedFile:
     """One file decided on during planning, before it reaches the database."""
 
@@ -61,15 +72,33 @@ async def _collect(
     *,
     include_trashed: bool,
     policy: NamingPolicy,
+    should_stop: Callable[[], bool] | None = None,
+    selection: set[str] | None = None,
 ) -> list[PlannedFile]:
-    """Walk the source tree, resolving names and export formats as we go."""
+    """Walk the source tree, resolving names and export formats as we go.
+
+    ``selection`` narrows the top level to the items the user ticked. It
+    applies only there: a ticked folder is taken whole, which is what ticking
+    a folder means.
+    """
     planned: list[PlannedFile] = []
     visited: set[str] = {root_id}
     queue: list[tuple[str, str]] = [(root_id, "")]
 
     while queue:
+        # Checked once per folder, which is once per network round trip - the
+        # finest granularity available without splitting a single listing.
+        if should_stop is not None and should_stop():
+            raise PlanningInterrupted(
+                f"stopped after {len(planned)} files, with {len(queue)} folders left"
+            )
         folder_id, rel_path = queue.pop(0)
         children = await source.list_children(folder_id, include_trashed=include_trashed)
+
+        if selection and folder_id == root_id:
+            # Matched before shortcuts are resolved, because the listing the
+            # user ticked showed the shortcut, not its target.
+            children = [child for child in children if child.id in selection]
 
         # Folders and files compete for the same names on OneDrive, so one
         # taken-set covers both.
@@ -174,6 +203,7 @@ async def plan_job(
     job_id: int,
     source: SourceProvider,
     settings: Settings | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> int:
     """Populate a job's file tasks and totals. Returns the number of files.
 
@@ -190,17 +220,27 @@ async def plan_job(
         root_id = job.source_folder_id
         include_trashed = job.include_trashed
         direction = job.direction
+        selection = set(job.selection or [])
 
     # Names have to satisfy the destination, which depends on the direction.
     _, dest_side = Direction.SIDES.get(direction, ("gdrive", "onedrive"))
     policy = POLICIES[dest_side]
 
     log.info(
-        "planning job %d (%s) from folder %s, naming for %s",
-        job_id, direction, root_id, policy.provider,
+        "planning job %d (%s) from folder %s (%s), naming for %s",
+        job_id,
+        direction,
+        root_id,
+        f"{len(selection)} selected items" if selection else "whole folder",
+        policy.provider,
     )
     planned = await _collect(
-        source, root_id, include_trashed=include_trashed, policy=policy
+        source,
+        root_id,
+        include_trashed=include_trashed,
+        policy=policy,
+        should_stop=should_stop,
+        selection=selection or None,
     )
 
     async with session_scope(settings) as session:

@@ -229,3 +229,80 @@ async def test_planning_an_empty_folder_is_not_an_error(db, drive, job_factory):
     job_id = await job_factory("root", "dest")
     assert await plan_job(job_id, drive, db) == 0
     assert (await _job(db, job_id)).total_files == 0
+
+
+# ------------------------------------------------- transferring a selection
+
+
+async def test_an_empty_selection_means_the_whole_folder(db, drive, job_factory):
+    drive.add_file("a.txt", b"a")
+    drive.add_file("b.txt", b"b")
+    job_id = await job_factory("root", "dest")
+
+    assert await plan_job(job_id, drive, db) == 2
+
+
+async def test_only_the_ticked_files_are_planned(db, drive, job_factory):
+    keep = drive.add_file("keep.txt", b"keep")
+    drive.add_file("skip.txt", b"skip")
+    drive.add_file("also-skip.txt", b"nope")
+
+    job_id = await job_factory("root", "dest", selection=[keep.id])
+    count = await plan_job(job_id, drive, db)
+
+    assert count == 1
+    assert [t.dest_name for t in await _tasks(db, job_id)] == ["keep.txt"]
+
+
+async def test_a_ticked_folder_is_taken_whole(db, drive, job_factory):
+    """Ticking a folder means the folder, not just its immediate children."""
+    wanted = drive.add_folder("Wanted")
+    inner = drive.add_folder("Inner", parent=wanted.id)
+    drive.add_file("one.txt", b"1", parent=wanted.id)
+    drive.add_file("two.txt", b"2", parent=inner.id)
+    drive.add_folder("Unwanted")
+    drive.add_file("loose.txt", b"x")
+
+    job_id = await job_factory("root", "dest", selection=[wanted.id])
+    await plan_job(job_id, drive, db)
+
+    paths = {
+        (t.rel_path + "/" + t.dest_name if t.rel_path else t.dest_name)
+        for t in await _tasks(db, job_id)
+    }
+    assert paths == {"Wanted/one.txt", "Wanted/Inner/two.txt"}
+
+
+async def test_files_and_folders_can_be_ticked_together(db, drive, job_factory):
+    folder = drive.add_folder("Pictures")
+    drive.add_file("photo.jpg", b"img", parent=folder.id)
+    loose = drive.add_file("notes.txt", b"notes")
+    drive.add_file("ignored.txt", b"no")
+
+    job_id = await job_factory("root", "dest", selection=[folder.id, loose.id])
+    await plan_job(job_id, drive, db)
+
+    paths = {
+        (t.rel_path + "/" + t.dest_name if t.rel_path else t.dest_name)
+        for t in await _tasks(db, job_id)
+    }
+    assert paths == {"Pictures/photo.jpg", "notes.txt"}
+
+
+async def test_the_selection_only_narrows_the_top_level(db, drive, job_factory):
+    """An id that happens to match something deeper must not filter it out."""
+    folder = drive.add_folder("Docs")
+    deep = drive.add_file("deep.txt", b"deep", parent=folder.id)
+
+    # Tick the folder only; the file inside shares no id with the selection.
+    job_id = await job_factory("root", "dest", selection=[folder.id])
+    await plan_job(job_id, drive, db)
+
+    assert [t.source_id for t in await _tasks(db, job_id)] == [deep.id]
+
+
+async def test_a_selection_naming_nothing_present_plans_nothing(db, drive, job_factory):
+    drive.add_file("a.txt", b"a")
+    job_id = await job_factory("root", "dest", selection=["an-id-that-is-not-here"])
+
+    assert await plan_job(job_id, drive, db) == 0
