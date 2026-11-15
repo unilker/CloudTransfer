@@ -377,6 +377,20 @@ a second, independently written implementation.
 
 ---
 
+## Licence
+
+CloudTransfer is free software under the **GNU General Public License,
+version 3**. The full text is in [`LICENSE`](LICENSE), and a copy is installed
+alongside the application.
+
+In short: you may use, study, share and modify it, and if you distribute a
+modified version you pass on the same freedoms, with its source.
+
+It is distributed in the hope that it will be useful, but **without any
+warranty** — see sections 15 to 17 of the licence.
+
+---
+
 ## Layout
 
 ```

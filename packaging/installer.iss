@@ -107,6 +107,9 @@ Name: "startupicon"; Description: "Start CloudTransfer when I sign in"; \
 ; The whole PyInstaller one-folder build.
 Source: "..\dist\CloudTransfer\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
+; The GPL requires the licence to accompany the program, so it is installed
+; alongside it rather than only shown during setup.
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"

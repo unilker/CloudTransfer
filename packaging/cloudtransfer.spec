@@ -31,6 +31,8 @@ ICON_PNG = SPEC_DIR / "cloudtransfer.png"
 datas = [
     (str(PACKAGE / "web" / "templates"), "cloudtransfer/web/templates"),
     (str(PACKAGE / "web" / "static"), "cloudtransfer/web/static"),
+    # The GPL asks that the licence accompany the program.
+    (str(ROOT / "LICENSE"), "."),
 ]
 
 # pystray picks its backend by platform at import time, and importing it on a
