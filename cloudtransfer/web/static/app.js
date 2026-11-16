@@ -722,6 +722,14 @@ function jobCard(job) {
   if (job.eta_seconds !== null && job.eta_seconds !== undefined && active) {
     stats.push(t('job.eta', { time: duration(job.eta_seconds) }));
   }
+  // While the walk is still running the totals keep climbing, so the progress
+  // figures are against a moving target. Saying so is the difference between
+  // "working" and "stuck", which is all someone watching a big folder wants.
+  if (job.plan_complete === false && active) {
+    stats.push(
+      `<span class="warn">${escapeHtml(t('job.counting', { n: job.total_files }))}</span>`
+    );
+  }
   if (job.failed_files) {
     stats.push(`<span class="bad">${escapeHtml(t('job.failed', { n: job.failed_files }))}</span>`);
   }

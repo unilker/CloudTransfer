@@ -437,10 +437,53 @@ async def test_cancelling_while_counting_stops_promptly(
     assert (await _job(db, job_id)).status == JobStatus.CANCELLED
 
 
-async def test_a_half_counted_tree_is_not_saved_as_the_plan(
+async def test_files_move_while_the_tree_is_still_being_counted(
     db, drive, onedrive, runner, job_factory
 ):
-    """A partial plan would look complete and move only some of the files."""
+    """The point of counting in the background.
+
+    A 400 GB folder is thousands of round trips to walk. Waiting for the last
+    of them before the first byte moves left a real transfer sitting on
+    "counting files" for hours with nothing to show.
+    """
+    _deep_tree(drive)
+    drive.list_delay = 0.25  # twelve folders, so roughly three seconds of walking
+
+    job_id = await job_factory("root", onedrive.root.id)
+    await runner.start(job_id)
+
+    for _ in range(200):
+        if onedrive.tree():
+            break
+        await asyncio.sleep(0.05)
+
+    # Something has landed at the destination; the walk cannot have finished.
+    assert onedrive.tree(), "nothing transferred while counting was still going"
+    job = await _job(db, job_id)
+    assert not job.plan_complete
+    # The planner and the loop both used to write this field; whichever
+    # committed last won, and a transferring job could read "pending".
+    assert job.status == JobStatus.RUNNING
+
+    await _finish(runner, job_id)
+    job = await _job(db, job_id)
+    assert job.status == JobStatus.COMPLETED
+    assert job.plan_complete
+    assert job.done_files == 12
+    assert len(onedrive.tree()) == 12
+
+
+async def test_a_half_counted_tree_is_never_filed_as_finished(
+    db, drive, onedrive, runner, job_factory
+):
+    """A partial plan is kept, but must not be mistaken for the whole tree.
+
+    What was counted is real work and worth keeping - throwing it away made a
+    pause cost the entire walk. The danger is the other side of it: once every
+    counted file has moved there is nothing outstanding, and a job that judged
+    itself by that alone would report success having silently skipped whatever
+    the walk never reached.
+    """
     _deep_tree(drive)
     drive.list_delay = 0.25
 
@@ -450,17 +493,23 @@ async def test_a_half_counted_tree_is_not_saved_as_the_plan(
     await runner.pause(job_id)
     await _finish(runner, job_id)
 
-    assert await _tasks(db, job_id) == []
-    assert (await _job(db, job_id)).total_files == 0
+    job = await _job(db, job_id)
+    partial = await _tasks(db, job_id)
+    assert partial, "the counting done so far should survive a pause"
+    assert not job.plan_complete
+    assert job.status == JobStatus.PAUSED
+    assert len(partial) < 12, "the walk was supposed to be cut short"
 
-    # Resuming counts again from the start and moves everything.
+    # Resuming carries on counting and ends up with every file, exactly once.
     drive.list_delay = 0.0
     await runner.start(job_id)
     await _finish(runner, job_id)
 
     job = await _job(db, job_id)
     assert job.status == JobStatus.COMPLETED
+    assert job.plan_complete
     assert job.done_files == 12
+    assert len(await _tasks(db, job_id)) == 12  # nothing counted twice
     assert len(onedrive.tree()) == 12
 
 

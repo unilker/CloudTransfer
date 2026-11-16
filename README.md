@@ -51,6 +51,22 @@ or tick nothing and the whole folder moves. A ticked folder is taken whole.
 The choice applies to the folder on screen, so navigating elsewhere starts a
 fresh selection.
 
+**Counting and moving at once.** A folder has to be walked before its files
+can be moved, and walking a large one is thousands of requests - a 400 GB
+folder of several thousand files can take hours, most of it spent waiting on
+the other end. That walk no longer holds up the transfer: each folder's files
+are written down as that folder is read, and the transfer picks them up
+immediately, so the first bytes move within seconds. It is safe because names
+are made unique *within* a folder and never across folders, so a folder's
+names are final the moment it has been listed. While the walk is still going
+the job says how many files it has found so far, since totals that climb for
+an hour otherwise look like a stuck progress bar.
+
+A count that is interrupted is kept rather than discarded, so a pause does not
+cost the whole walk, and resuming carries on from what is already written
+while the rest is counted. A job whose walk never finished is never reported
+as completed, even once every file it did find has moved.
+
 **Stopping.** Pause, cancel and delete act between chunks, and also during the
 counting pass - a large folder is many requests, and waiting for all of them
 before acknowledging a pause makes the button look broken. Deleting a running

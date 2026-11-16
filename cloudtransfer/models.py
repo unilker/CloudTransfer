@@ -173,6 +173,11 @@ class Job(Base):
     verify: Mapped[bool] = mapped_column(Boolean, default=True)
     include_trashed: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # False while the source tree is still being walked. Tasks are written as
+    # each folder is read, so a job can transfer and count at the same time;
+    # anything reading the totals needs to know they are still growing.
+    plan_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     total_files: Mapped[int] = mapped_column(Integer, default=0)
     total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     done_files: Mapped[int] = mapped_column(Integer, default=0)

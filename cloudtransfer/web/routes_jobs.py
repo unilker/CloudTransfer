@@ -63,6 +63,10 @@ def _job_dict(job: Job) -> dict:
         "dest_folder_path": job.dest_folder_path,
         "conflict_policy": job.conflict_policy,
         "verify": job.verify,
+        # False while the source tree is still being walked, which means the
+        # totals below are still growing. The UI has to say so, or a count
+        # that climbs for hours looks like a stuck progress bar.
+        "plan_complete": job.plan_complete,
         "total_files": job.total_files,
         "total_bytes": job.total_bytes,
         "done_files": job.done_files,

@@ -30,12 +30,18 @@ from ..naming import join_path
 from ..providers.gdrive import GoogleDriveDest, GoogleDriveSource
 from ..providers.onedrive import OneDriveDest, OneDriveSource
 from .planner import PlanningInterrupted, plan_job
+from .totals import refresh_totals
 from .transfer import FileTransfer
 
 log = logging.getLogger(__name__)
 
 # How often a running file's byte count is written to SQLite.
 PROGRESS_FLUSH_SECONDS = 1.0
+
+# How long to wait for the planner to produce more work before looking again.
+# Only reached when the transfer has drained everything counted so far, which
+# on a big tree means the walk is the slow side.
+PLAN_POLL_SECONDS = 0.5
 
 
 class JobStopped(CloudTransferError):
@@ -48,36 +54,7 @@ async def _recount(session, job_id: int) -> None:
     Called whenever a task settles and again when the run ends, so a paused
     job's figures are current rather than frozen at the last completed file.
     """
-    job = await session.get(Job, job_id)
-    if job is None:  # pragma: no cover - deleted mid-flight
-        return
-
-    counts = dict(
-        (
-            await session.execute(
-                select(FileTask.status, func.count())
-                .where(FileTask.job_id == job_id)
-                .group_by(FileTask.status)
-            )
-        ).all()
-    )
-    # Every byte the destination holds, not only those in finished files. A
-    # paused job would otherwise report nothing moved, when in fact the
-    # destination is keeping the partial uploads and a resume continues from
-    # them.
-    moved = (
-        await session.execute(
-            select(func.coalesce(func.sum(FileTask.bytes_done), 0)).where(
-                FileTask.job_id == job_id,
-                FileTask.status != TaskStatus.SKIPPED,
-            )
-        )
-    ).scalar_one()
-
-    job.done_files = counts.get(TaskStatus.DONE, 0)
-    job.failed_files = counts.get(TaskStatus.FAILED, 0)
-    job.skipped_files = counts.get(TaskStatus.SKIPPED, 0)
-    job.done_bytes = int(moved or 0)
+    await refresh_totals(session, job_id)
 
 
 def build_providers(direction: str, settings: Settings, client):
@@ -216,25 +193,36 @@ class JobRunner:
                 job = await session.get(Job, job_id)
                 if job is None:
                     raise ValueError(f"job {job_id} does not exist")
-                pending_count = (
+                task_count = (
                     await session.execute(
                         select(func.count())
                         .select_from(FileTask)
                         .where(FileTask.job_id == job_id)
                     )
                 ).scalar_one()
+                plan_complete = job.plan_complete
 
-            if pending_count == 0:
-                try:
-                    await plan_job(
-                        job_id, source, self.settings, should_stop=stop.is_set
+            # Counting a large tree is thousands of round trips, so it runs
+            # alongside the transfer rather than in front of it: the planner
+            # writes each folder's files as it reads them and the loop below
+            # picks them up. A 400 GB tree starts moving in seconds instead of
+            # after a walk that can take hours.
+            #
+            # An unfinished plan is always resumed, even when tasks exist, or
+            # the rest of the tree would never be counted.
+            planner: asyncio.Task | None = None
+            if not plan_complete or task_count == 0:
+                planner = asyncio.create_task(
+                    plan_job(
+                        job_id,
+                        source,
+                        self.settings,
+                        should_stop=stop.is_set,
+                        # The status is set to RUNNING just below and belongs
+                        # to this loop from here on.
+                        manage_status=False,
                     )
-                except PlanningInterrupted as exc:
-                    log.info("job %d: counting was stopped (%s)", job_id, exc)
-                    await self._finalize(job_id, stop, interrupted=True)
-                    await source.close()
-                    await dest.close()
-                    return
+                )
 
             async with session_scope(self.settings) as session:
                 job = await session.get(Job, job_id)
@@ -298,6 +286,10 @@ class JobRunner:
                         .all()
                     )
                 if not batch:
+                    if planner is not None and not planner.done():
+                        # Nothing to do *yet*: the walk is still finding files.
+                        await asyncio.sleep(PLAN_POLL_SECONDS)
+                        continue
                     break
 
                 await asyncio.gather(
@@ -318,7 +310,19 @@ class JobRunner:
                     )
                 )
 
-            await self._finalize(job_id, stop)
+            interrupted = False
+            if planner is not None:
+                try:
+                    await planner
+                except PlanningInterrupted as exc:
+                    log.info("job %d: counting was stopped (%s)", job_id, exc)
+                    interrupted = True
+                except Exception:
+                    await source.close()
+                    await dest.close()
+                    raise
+
+            await self._finalize(job_id, stop, interrupted=interrupted)
 
             await source.close()
             await dest.close()
@@ -549,6 +553,11 @@ class JobRunner:
             elif interrupted or (stop.is_set() and remaining):
                 job.status = JobStatus.PAUSED
             elif remaining:  # pragma: no cover - loop exits when none remain
+                job.status = JobStatus.PAUSED
+            elif not job.plan_complete:
+                # Everything counted so far has moved, but the walk never
+                # reached the end of the tree, so files remain that were never
+                # written down. Calling this finished would quietly lose them.
                 job.status = JobStatus.PAUSED
             elif job.failed_files:
                 job.status = JobStatus.COMPLETED_WITH_ERRORS
